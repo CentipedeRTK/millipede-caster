@@ -25,6 +25,7 @@
 
 #include "caster.h"
 #include "config.h"
+#include "ip.h"
 #include "jobs.h"
 #include "livesource.h"
 #include "log.h"
@@ -52,7 +53,7 @@ static void listener_cb(struct evconnlistener *listener, evutil_socket_t fd, str
  */
 static struct auth_entry *auth_parse(struct caster_state *caster, const char *filename) {
 	struct parsed_file *p;
-	p = file_parse(filename, 3, ":");
+	p = file_parse(filename, 3, ":", 0);
 
 	if (p == NULL) {
 		logfmt(&caster->flog, "Can't read or parse %s\n", filename);
@@ -136,6 +137,8 @@ caster_new(struct config *config, const char *config_file) {
 	this->socks = NULL;
 	this->sourcetable_fetchers = NULL;
 	this->sourcetable_fetchers_count = 0;
+	this->blocklist = NULL;
+
 
 	P_RWLOCK_INIT(&this->livesources.lock, NULL);
 	P_MUTEX_INIT(&this->livesources.delete_lock, NULL);
@@ -143,8 +146,10 @@ caster_new(struct config *config, const char *config_file) {
 	P_RWLOCK_INIT(&this->ntrips.free_lock, NULL);
 	this->ntrips.next_id = 1;
 
+	this->ntrips.ipcount = hash_table_new(509);
+
 	// Used only for access to source_auth and host_auth
-	P_RWLOCK_INIT(&this->authlock, NULL);
+	P_RWLOCK_INIT(&this->configlock, NULL);
 
 	P_RWLOCK_INIT(&this->sourcetablestack.lock, NULL);
 
@@ -171,10 +176,11 @@ caster_new(struct config *config, const char *config_file) {
 	fchdir(current_dir);
 	close(current_dir);
 
-	if (r1 < 0 || r2 < 0 || !this->config_dir || (threads && this->joblist == NULL)) {
+	if (r1 < 0 || r2 < 0 || !this->config_dir || (threads && this->joblist == NULL) || this->ntrips.ipcount == NULL) {
 		if (this->joblist) joblist_free(this->joblist);
 		if (r1 < 0) log_free(&this->flog);
 		if (r2 < 0) log_free(&this->alog);
+		if (this->ntrips.ipcount) hash_table_free(this->ntrips.ipcount);
 		strfree(this->config_dir);
 		free(this);
 		return NULL;
@@ -207,11 +213,14 @@ void caster_free(struct caster_state *this) {
 			evconnlistener_free(this->listeners[i]);
 	free(this->listeners);
 	free(this->socks);
+	hash_table_free(this->ntrips.ipcount);
 
 	caster_free_fetchers(this);
 
 	auth_free(this->host_auth);
 	auth_free(this->source_auth);
+	if (this->blocklist)
+		prefix_table_free(this->blocklist);
 
 	evdns_base_free(this->dns_base, 1);
 	event_base_free(this->base);
@@ -230,7 +239,7 @@ void caster_free(struct caster_state *this) {
 	P_MUTEX_DESTROY(&this->livesources.delete_lock);
 	P_RWLOCK_DESTROY(&this->ntrips.lock);
 	P_RWLOCK_DESTROY(&this->ntrips.free_lock);
-	P_RWLOCK_DESTROY(&this->authlock);
+	P_RWLOCK_DESTROY(&this->configlock);
 	log_free(&this->flog);
 	log_free(&this->alog);
 	strfree(this->config_dir);
@@ -267,32 +276,22 @@ static int caster_listen(struct caster_state *this) {
 	int err = 0;
 	for (int i = 0; i < this->config->bind_count; i++) {
 		int r, port;
-		struct sockaddr *sin = (struct sockaddr *)(this->socks+i);
-		size_t size_sin = 0;
-
-		memset(&this->socks[i], 0, sizeof(this->socks[i]));
+		union sock *sin = this->socks+i;
 
 		port = htons(this->config->bind[i].port);
-		r = inet_pton(AF_INET6, this->config->bind[i].ip, &this->socks[i].sin6.sin6_addr);
-		if (r) {
-			this->socks[i].sin6.sin6_port = port;
-			this->socks[i].sin6.sin6_family = AF_INET6;
-			size_sin = sizeof(struct sockaddr_in6);
-		} else {
-			r = inet_pton(AF_INET, this->config->bind[i].ip, &this->socks[i].sin.sin_addr);
-			if (r) {
-				this->socks[i].sin.sin_port = port;
-				this->socks[i].sin.sin_family = AF_INET;
-				size_sin = sizeof(struct sockaddr_in);
-			} else {
-				fprintf(stderr, "Invalid IP %s\n", this->config->bind[i].ip);
-				err = 1;
-				continue;
-			}
+		r = ip_convert(this->config->bind[i].ip, sin);
+		if (!r) {
+			fprintf(stderr, "Invalid IP %s\n", this->config->bind[i].ip);
+			err = 1;
+			continue;
 		}
+		if (sin->generic.sa_family == AF_INET)
+			sin->v4.sin_port = port;
+		else
+			sin->v6.sin6_port = port;
 		this->listeners[i] = evconnlistener_new_bind(this->base, listener_cb, this,
 			LEV_OPT_REUSEABLE|LEV_OPT_CLOSE_ON_FREE, this->config->bind[i].queue_size,
-			sin, size_sin);
+			(struct sockaddr *)sin, sin->generic.sa_len);
 		if (!this->listeners[i]) {
 			fprintf(stderr, "Could not create a listener for %s:%d!\n", this->config->bind[i].ip, this->config->bind[i].port);
 			err = 1;
@@ -353,7 +352,7 @@ static void
 caster_reload_auth(struct caster_state *caster) {
 	logfmt(&caster->flog, "Reloading %s and %s\n", caster->config->host_auth_filename, caster->config->source_auth_filename);
 
-	P_RWLOCK_WRLOCK(&caster->authlock);
+	P_RWLOCK_WRLOCK(&caster->configlock);
 
 	if (caster->config->host_auth_filename) {
 		struct auth_entry *tmp = auth_parse(caster, caster->config->host_auth_filename);
@@ -370,7 +369,24 @@ caster_reload_auth(struct caster_state *caster) {
 		}
 	}
 
-	P_RWLOCK_UNLOCK(&caster->authlock);
+	P_RWLOCK_UNLOCK(&caster->configlock);
+}
+
+static void
+caster_reload_blocklist(struct caster_state *caster) {
+	P_RWLOCK_WRLOCK(&caster->configlock);
+	struct prefix_table *p;
+	if (caster->blocklist) {
+		prefix_table_free(caster->blocklist);
+		caster->blocklist = NULL;
+	}
+
+	if (caster->config->blocklist_filename) {
+		logfmt(&caster->flog, "Reloading %s\n", caster->config->blocklist_filename);
+		p = prefix_table_new(caster->config->blocklist_filename);
+		caster->blocklist = p;
+	}
+	P_RWLOCK_UNLOCK(&caster->configlock);
 }
 
 static void caster_reload_config(struct caster_state *this) {
@@ -393,6 +409,7 @@ static void caster_chdir_reload(struct caster_state *this, int reopen_logs) {
 		caster_reopen_logs(this);
 	caster_reload_sourcetables(this);
 	caster_reload_auth(this);
+	caster_reload_blocklist(this);
 	fchdir(current_dir);
 	close(current_dir);
 }
@@ -411,22 +428,27 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
 
 	if (bev == NULL) {
-		logfmt(&caster->flog, "Error constructing bufferevent!");
+		logfmt(&caster->flog, "Error constructing bufferevent!\n");
 		close(fd);
 		return;
 	}
 
 	struct ntrip_state *st = ntrip_new(caster, bev, NULL, 0, NULL);
 	if (st == NULL) {
-		logfmt(&caster->flog, "Error constructing ntrip_state for a new connection!");
+		logfmt(&caster->flog, "Error constructing ntrip_state for a new connection!\n");
 		bufferevent_free(bev);
 		close(fd);
 		return;
 	}
 
 	ntrip_set_peeraddr(st, sa, socklen);
+
 	st->state = NTRIP_WAIT_HTTP_METHOD;
-	ntrip_register(st);
+
+	if (ntrip_register_check(st) < 0) {
+		ntrip_deferred_free(st, "listener_cb");
+		return;
+	}
 
 	ntrip_log(st, LOG_INFO, "New connection\n");
 
