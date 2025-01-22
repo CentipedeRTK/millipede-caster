@@ -117,6 +117,7 @@ struct ntrip_state {
 	struct bufferevent *bev;		// main bufferevent associated with the session
 	char bev_freed;				// has it been freed already?
 	struct evbuffer *input;
+	int fd;					// file descriptor for the bufferevent
 
 	struct {
 		struct evbuffer *raw_input;
@@ -198,6 +199,7 @@ struct ntrip_state {
 struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *bev, char *host, unsigned short port, char *mountpoint);
 void ntrip_register(struct ntrip_state *this);
 int ntrip_register_check(struct ntrip_state *this);
+void ntrip_set_fd(struct ntrip_state *this);
 void ntrip_set_peeraddr(struct ntrip_state *this, struct sockaddr *sa, size_t socklen);
 void ntrip_free(struct ntrip_state *this, char *orig);
 void ntrip_deferred_free(struct ntrip_state *this, char *orig);

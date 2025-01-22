@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <string.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 
@@ -67,6 +68,10 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->newjobs = 0;
 	this->bev_freed = 0;
 	this->bev = bev;
+
+	// Explicitly copied to avoid locking issues later with bufferevent_getfd()
+	this->fd = bufferevent_getfd(bev);
+
 	this->input = bufferevent_get_input(bev);
 	this->filter.in_filter = NULL;
 	this->filter.raw_input = this->input;
@@ -155,16 +160,20 @@ int ntrip_register_check(struct ntrip_state *this) {
 }
 
 /*
+ * Cache the socket fd for easier access later.
+ */
+void ntrip_set_fd(struct ntrip_state *this) {
+	this->fd = bufferevent_getfd(this->bev);
+}
+
+/*
  * Set peer address, either from a provided sockaddr (sa != NULL) or
  * from getpeername() if sa == NULL.
  */
 void ntrip_set_peeraddr(struct ntrip_state *this, struct sockaddr *sa, size_t socklen) {
 	if (sa == NULL) {
-		evutil_socket_t fd = bufferevent_getfd(this->bev);
-		if (fd < 0)
-			return;
 		socklen_t psocklen = sizeof(this->peeraddr);
-		if (getpeername(fd, &this->peeraddr.generic, &psocklen) < 0) {
+		if (getpeername(this->fd, &this->peeraddr.generic, &psocklen) < 0) {
 			ntrip_log(this, LOG_NOTICE, "getpeername failed: %s\n", strerror(errno));
 			return;
 		}
@@ -397,6 +406,24 @@ static json_object *ntrip_json(struct ntrip_state *st) {
 	if (st->user_agent)
 		json_object_object_add(new_obj, "user-agent", json_object_new_string(st->user_agent));
 
+	struct tcp_info ti;
+	socklen_t ti_len = sizeof ti;
+	if (getsockopt(st->fd, IPPROTO_TCP, TCP_INFO, &ti, &ti_len) >= 0) {
+		json_object *tcpi_obj = json_object_new_object();
+		json_object_object_add(tcpi_obj, "rtt", json_object_new_int64(ti.tcpi_rtt));
+		json_object_object_add(tcpi_obj, "rttvar", json_object_new_int64(ti.tcpi_rttvar));
+		json_object_object_add(tcpi_obj, "snd_mss", json_object_new_int64(ti.tcpi_snd_mss));
+		json_object_object_add(tcpi_obj, "rcv_mss", json_object_new_int64(ti.tcpi_rcv_mss));
+		json_object_object_add(tcpi_obj, "last_data_recv", json_object_new_int64(ti.tcpi_last_data_recv));
+		json_object_object_add(tcpi_obj, "rcv_wnd", json_object_new_int64(ti.tcpi_rcv_space));
+#ifdef __FreeBSD__
+		// FreeBSD-specific
+		json_object_object_add(tcpi_obj, "snd_wnd", json_object_new_int64(ti.tcpi_snd_wnd));
+		json_object_object_add(tcpi_obj, "snd_rexmitpack", json_object_new_int64(ti.tcpi_snd_rexmitpack));
+#endif
+		json_object_object_add(new_obj, "tcp_info", tcpi_obj);
+	}
+
 	char iso_date[30];
 	iso_date_from_timeval(iso_date, sizeof iso_date, &st->start);
 	json_object_object_add(new_obj, "start", json_object_new_string(iso_date));
@@ -553,7 +580,7 @@ int ntrip_handle_raw(struct ntrip_state *st) {
 	while (1) {
 
 		unsigned long len_raw = evbuffer_get_length(input);
-		ntrip_log(st, LOG_INFO, "ntrip_handle_raw ready to get %d bytes\n", len_raw);
+		ntrip_log(st, LOG_EDEBUG, "ntrip_handle_raw ready to get %d bytes\n", len_raw);
 		if (len_raw < st->caster->config->min_raw_packet)
 			return 0;
 		if (len_raw > st->caster->config->max_raw_packet)

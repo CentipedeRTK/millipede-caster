@@ -222,6 +222,7 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 				end = 1;
 			} else {
 				if (sourcetable_add(st->tmp_sourcetable, line, 1) < 0) {
+					ntrip_log(st, LOG_INFO, "Error when inserting sourcetable line from %s:%d\n", st->tmp_sourcetable->caster, st->tmp_sourcetable->port);
 					end = 1;
 				}
 			}
@@ -271,6 +272,9 @@ void ntripcli_eventcb(struct bufferevent *bev, short events, void *arg) {
 	struct ntrip_state *st = (struct ntrip_state *)arg;
 
 	if (events & BEV_EVENT_CONNECTED) {
+		// Has to be done now: not known from libevent before the connection is complete
+		ntrip_set_fd(st);
+
 		ntrip_set_peeraddr(st, NULL, 0);
 		ntrip_log(st, LOG_INFO, "Connected to %s:%d for /%s\n", st->host, st->port, st->mountpoint);
 		char *uri = (char *)strmalloc(strlen(st->mountpoint) + 3);
