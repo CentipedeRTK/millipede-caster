@@ -5,6 +5,8 @@
 #include <sys/types.h>
 #include <pthread.h>
 
+#include <openssl/ssl.h>
+
 #include "conf.h"
 #include "config.h"
 #include "hash.h"
@@ -15,6 +17,18 @@
 #include "queue.h"
 #include "sourcetable.h"
 #include "util.h"
+
+/*
+ * Descriptor for a listener
+ */
+struct listener {
+	union sock sockaddr;			// Listening address
+	struct evconnlistener *listener;	// libevent structure
+	struct caster_state *caster;
+
+	int tls;			// is TLS activated?
+	SSL_CTX *ssl_server_ctx;	// TLS context, certs etc.
+};
 
 /*
  * State for a caster
@@ -37,10 +51,9 @@ struct caster_state {
 	struct event_base *base;
 	struct evdns_base *dns_base;
 
-	// Array of listening addresses
-	union sock *socks;
-	// Array of pointers to libevent listeners, same size
-        struct evconnlistener **listeners;
+	// Array of pointers to listener configurations
+	struct listener **listeners;
+	int listeners_count;
 
 	P_RWLOCK_T configlock;
 	struct auth_entry *host_auth;

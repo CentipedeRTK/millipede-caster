@@ -18,10 +18,14 @@
 
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
+#include <event2/bufferevent_ssl.h>
 #include <event2/dns.h>
 #include <event2/listener.h>
 #include <event2/event.h>
 #include <event2/thread.h>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "caster.h"
 #include "config.h"
@@ -113,6 +117,17 @@ caster_log(void *arg, const char *fmt, va_list ap) {
 	_caster_log(this->flog.logfile, fmt, ap);
 }
 
+/*
+ * Callback for OpenSSL's ERR_print_errors_cb()
+ */
+
+static int
+caster_tls_log_cb(const char *str, size_t len, void *u) {
+	logfmt(&((struct caster_state *)u)->flog, "%s\n", str);
+	// Undocumentend OpenSSL API: return >0 if ok, <=0 if failed
+	return 1;
+}
+
 static struct caster_state *
 caster_new(struct config *config, const char *config_file) {
 	struct caster_state *this = (struct caster_state *)calloc(1, sizeof(struct caster_state));
@@ -134,11 +149,10 @@ caster_new(struct config *config, const char *config_file) {
 	}
 
 	this->listeners = NULL;
-	this->socks = NULL;
+	this->listeners_count = 0;
 	this->sourcetable_fetchers = NULL;
 	this->sourcetable_fetchers_count = 0;
 	this->blocklist = NULL;
-
 
 	P_RWLOCK_INIT(&this->livesources.lock, NULL);
 	P_MUTEX_INIT(&this->livesources.delete_lock, NULL);
@@ -148,7 +162,7 @@ caster_new(struct config *config, const char *config_file) {
 
 	this->ntrips.ipcount = hash_table_new(509, NULL);
 
-	// Used only for access to source_auth and host_auth
+	// Used for access to source_auth, host_auth, blocklist and listener config
 	P_RWLOCK_INIT(&this->configlock, NULL);
 
 	P_RWLOCK_INIT(&this->sourcetablestack.lock, NULL);
@@ -197,6 +211,22 @@ caster_new(struct config *config, const char *config_file) {
 	return this;
 }
 
+static void caster_free_listener(struct listener *this) {
+	if (this->listener)
+		evconnlistener_free(this->listener);
+	if (this->tls && this->ssl_server_ctx)
+		SSL_CTX_free(this->ssl_server_ctx);
+	free(this);
+}
+
+static void caster_free_listeners(struct caster_state *this) {
+	for (int i = 0; i < this->listeners_count; i++)
+		caster_free_listener(this->listeners[i]);
+	free(this->listeners);
+	this->listeners = NULL;
+	this->listeners_count = 0;
+}
+
 void caster_free(struct caster_state *this) {
 	if (threads)
 		jobs_stop_threads(this->joblist);
@@ -208,11 +238,7 @@ void caster_free(struct caster_state *this) {
 	if (this->signalint_event)
 		event_free(this->signalint_event);
 
-	for (int i = 0; i < this->config->bind_count; i++)
-		if (this->listeners[i])
-			evconnlistener_free(this->listeners[i]);
-	free(this->listeners);
-	free(this->socks);
+	caster_free_listeners(this);
 	hash_table_free(this->ntrips.ipcount);
 
 	caster_free_fetchers(this);
@@ -249,23 +275,91 @@ void caster_free(struct caster_state *this) {
 }
 
 /*
- * Configure and activate listening ports.
+ * Load TLS certificates from file paths.
  */
-static int caster_listen(struct caster_state *this) {
+static int listener_load_certs(SSL_CTX *ctx, char *tls_full_certificate_chain, char *tls_private_key) {
+	if (SSL_CTX_use_certificate_chain_file(ctx, tls_full_certificate_chain) <= 0)
+		return -1;
+	if (SSL_CTX_use_PrivateKey_file(ctx, tls_private_key, SSL_FILETYPE_PEM) <= 0)
+		return -1;
+	if (!SSL_CTX_check_private_key(ctx)) {
+		fprintf(stderr, "Private key does not match the certificate public key\n");
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Set-up or update TLS server configuration.
+ */
+static int listener_setup_tls(struct listener *this, struct config_bind *config) {
+	if (!this->ssl_server_ctx) {
+		this->ssl_server_ctx = SSL_CTX_new(TLS_server_method());
+		if (this->ssl_server_ctx == NULL) {
+			ERR_print_errors_cb(caster_tls_log_cb, this->caster);
+			return -1;
+		}
+	}
+	if (listener_load_certs(this->ssl_server_ctx, config->tls_full_certificate_chain, config->tls_private_key) < 0) {
+		ERR_print_errors_cb(caster_tls_log_cb, this->caster);
+		SSL_CTX_free(this->ssl_server_ctx);
+		this->ssl_server_ctx = NULL;
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Configure a listening port for libevent.
+ */
+static int caster_start_listener(struct caster_state *this, struct config_bind *config, union sock *sin, struct listener *listener) {
+	listener->listener = NULL;
+	listener->sockaddr = *sin;
+	listener->caster = this;
+	int tls = config->tls;
+	listener->tls = tls;
+	listener->ssl_server_ctx = NULL;
+
+	if (config->tls && config->tls_full_certificate_chain && config->tls_private_key) {
+		if (listener_setup_tls(listener, config) < 0)
+			return -1;
+	}
+
+	listener->listener = evconnlistener_new_bind(this->base, listener_cb, listener,
+		LEV_OPT_REUSEABLE|LEV_OPT_CLOSE_ON_FREE, config->queue_size,
+		(struct sockaddr *)sin, sin->generic.sa_len);
+	if (!listener->listener) {
+		fprintf(stderr, "Could not create a listener for %s:%d!\n", config->ip, config->port);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Reconfigure listening ports, reusing already existing sockets if possible.
+ */
+static int caster_reload_listeners(struct caster_state *this) {
+	union sock sin;
+	unsigned short port;
+	int r, i;
+	struct listener **new_listeners;
+	char ip[64];
+
+	P_RWLOCK_WRLOCK(&this->configlock);
 	if (this->config->bind_count == 0) {
 		fprintf(stderr, "No configured ports to listen to, aborting.\n");
+		if (this->listeners)
+			caster_free_listeners(this);
+		P_RWLOCK_UNLOCK(&this->configlock);
 		return -1;
 	}
 
-	this->socks = (union sock *)malloc(sizeof(union sock)*this->config->bind_count);
-	if (!this->socks) {
-		fprintf(stderr, "Can't allocate socket addresses\n");
-		return -1;
-	}
-
-	this->listeners = (struct evconnlistener **)malloc(sizeof(struct evconnlistener *)*this->config->bind_count);
-	if (!this->listeners) {
+	new_listeners = (struct listener **)malloc(sizeof(struct listener *)*this->config->bind_count);
+	if (!new_listeners) {
 		fprintf(stderr, "Can't allocate listeners\n");
+		if (this->listeners)
+			caster_free_listeners(this);
+		P_RWLOCK_UNLOCK(&this->configlock);
 		return -1;
 	}
 
@@ -273,33 +367,87 @@ static int caster_listen(struct caster_state *this) {
 	 * Create listening socket addresses.
 	 * Create a libevent listener for each.
 	 */
-	int err = 0;
-	for (int i = 0; i < this->config->bind_count; i++) {
-		int r, port;
-		union sock *sin = this->socks+i;
+	int current_dir = open(".", O_DIRECTORY);
+	chdir(this->config_dir);
 
-		port = htons(this->config->bind[i].port);
-		r = ip_convert(this->config->bind[i].ip, sin);
+	int nlisteners = 0;
+
+	for (i = 0; i < this->config->bind_count; i++) {
+		struct config_bind *config = this->config->bind + i;
+		port = htons(config->port);
+		r = ip_convert(config->ip, &sin);
 		if (!r) {
 			fprintf(stderr, "Invalid IP %s\n", this->config->bind[i].ip);
-			err = 1;
 			continue;
 		}
-		if (sin->generic.sa_family == AF_INET)
-			sin->v4.sin_port = port;
+		if (sin.generic.sa_family == AF_INET)
+			sin.v4.sin_port = port;
 		else
-			sin->v6.sin6_port = port;
-		this->listeners[i] = evconnlistener_new_bind(this->base, listener_cb, this,
-			LEV_OPT_REUSEABLE|LEV_OPT_CLOSE_ON_FREE, this->config->bind[i].queue_size,
-			(struct sockaddr *)sin, sin->generic.sa_len);
-		if (!this->listeners[i]) {
-			fprintf(stderr, "Could not create a listener for %s:%d!\n", this->config->bind[i].ip, this->config->bind[i].port);
-			err = 1;
+			sin.v6.sin6_port = port;
+
+		/*
+		 * Try to find and recycle an existing listener entry
+		 */
+		struct listener *recycled_listener = NULL;
+		int j;
+		for (j = 0; j < this->listeners_count; j++) {
+			if (this->listeners[j] && !ip_cmp(&sin, &this->listeners[j]->sockaddr)) {
+				recycled_listener = this->listeners[j];
+				break;
+			}
+		}
+		if (recycled_listener) {
+			if (config->tls && listener_setup_tls(recycled_listener, config) < 0) {
+				fprintf(stderr, "Can't reuse listener %s: TLS setup failed\n", ip_str_port(&sin, ip, sizeof ip));
+				recycled_listener = NULL;
+			} else {
+				if (recycled_listener->tls && !config->tls) {
+					recycled_listener->tls = 0;
+					SSL_CTX_free(recycled_listener->ssl_server_ctx);
+				}
+				fprintf(stderr, "Reusing listener %s\n", ip_str_port(&sin, ip, sizeof ip));
+				new_listeners[nlisteners++] = recycled_listener;
+				this->listeners[j] = NULL;
+			}
+		}
+		if (!recycled_listener) {
+			/*
+			 * No reusable listener found, or reuse failed, start a new listener instance.
+			 */
+			struct listener *new_listener = (struct listener *)malloc(sizeof(struct listener));
+			if (new_listener) {
+				if (caster_start_listener(this, this->config->bind+i, &sin, new_listener) >= 0) {
+					new_listeners[nlisteners++] = new_listener;
+					fprintf(stderr, "Opening listener %s\n", ip_str_port(&sin, ip, sizeof ip));
+				} else {
+					fprintf(stderr, "Unable to open listener %s\n", ip_str_port(&sin, ip, sizeof ip));
+					caster_free_listener(new_listener);
+				}
+			}
 		}
 	}
+	fchdir(current_dir);
+	close(current_dir);
 
-	if (err)
+	/*
+	 * Drop remaining listening sockets we haven't reused.
+	 */
+	for (int j = 0; j < this->listeners_count; j++)
+		if (this->listeners[j]) {
+			fprintf(stderr, "Closing listener %s\n", ip_str_port(&this->listeners[j]->sockaddr, ip, sizeof ip));
+			caster_free_listener(this->listeners[j]);
+		}
+
+	free(this->listeners);
+	this->listeners = new_listeners;
+	this->listeners_count = nlisteners;
+
+	P_RWLOCK_UNLOCK(&this->configlock);
+
+	if (this->listeners_count == 0) {
+		fprintf(stderr, "No configured ports to listen to, aborting.\n");
 		return -1;
+	}
 	return 0;
 }
 
@@ -418,14 +566,32 @@ static void
 listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
     struct sockaddr *sa, int socklen, void *arg)
 {
-	struct caster_state *caster = arg;
+	struct listener *listener_conf = arg;
+	struct caster_state *caster = listener_conf->caster;
 	struct event_base *base = caster->base;
 	struct bufferevent *bev;
 
-	if (threads)
-		bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
-	else
-		bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+	P_RWLOCK_RDLOCK(&listener_conf->caster->configlock);
+	if (listener_conf->tls) {
+		SSL *ssl = SSL_new(listener_conf->ssl_server_ctx);
+		if (ssl == NULL) {
+			P_RWLOCK_UNLOCK(&listener_conf->caster->configlock);
+			ERR_print_errors_cb(caster_tls_log_cb, caster);
+			close(fd);
+			return;
+		}
+
+		if (threads)
+			bev = bufferevent_openssl_socket_new(caster->base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
+		else
+			bev = bufferevent_openssl_socket_new(caster->base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE);
+	} else {
+		if (threads)
+			bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
+		else
+			bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+	}
+	P_RWLOCK_UNLOCK(&listener_conf->caster->configlock);
 
 	if (bev == NULL) {
 		logfmt(&caster->flog, "Error constructing bufferevent!\n");
@@ -484,9 +650,7 @@ signalhup_cb(evutil_socket_t sig, short events, void *arg) {
 	struct caster_state *caster = (struct caster_state *)arg;
 	printf("Reloading configuration\n");
 	caster_reload_config(caster);
-	/*
-	 * TBD: listeners reload.
-	 */
+	caster_reload_listeners(caster);
 	caster_reload_fetchers(caster);
 	caster_chdir_reload(caster, 1);
 }
@@ -663,8 +827,7 @@ int caster_main(char *config_file) {
 	// setsockopt(0, IPV6CTL_V6ONLY, IPV6CTL_V6ONLY, &v6only, sizeof v6only);
 #endif
 
-
-	if (caster_listen(caster) < 0) {
+	if (caster_reload_listeners(caster) < 0) {
 		caster_free(caster);
 		return 1;
 	}
