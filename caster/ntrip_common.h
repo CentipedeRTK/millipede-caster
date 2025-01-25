@@ -3,6 +3,8 @@
 
 #include <netinet/in.h>
 
+#include <openssl/ssl.h>
+
 #include "conf.h"
 #include "caster.h"
 #include "ip.h"
@@ -21,6 +23,7 @@ enum ntrip_session_state {
 	NTRIP_WAIT_STREAM_SOURCE,	// Source connected, receive data (server)
 	NTRIP_WAIT_SOURCETABLE_LINE,	// Client waiting for the next sourcetable line
 	NTRIP_WAIT_CLIENT_INPUT,	// Server waiting for GGA lines from client
+	NTRIP_WAIT_CLIENT_CONTENT,	// Server waiting for content
 	NTRIP_WAIT_CLOSE,		// End of connection, drain output then close
 	NTRIP_FORCE_CLOSE,		// End of connection, force close now
 	NTRIP_END			// Ready for ntrip_free
@@ -118,6 +121,7 @@ struct ntrip_state {
 	char bev_freed;				// has it been freed already?
 	struct evbuffer *input;
 	int fd;					// file descriptor for the bufferevent
+	SSL *ssl;				// TLS state
 
 	struct {
 		struct evbuffer *raw_input;
@@ -150,7 +154,7 @@ struct ntrip_state {
 	 * NTRIP client state
 	 */
 	short status_code;			// HTTP status code received (client)
-	short client_version;			// NTRIP version in use
+	short client_version;			// NTRIP version in use: 0=plain HTTP, 1=NTRIP 1, 2=NTRIP 2
 	char *host;				// host to connect to
 	unsigned short port;			// port to connect to
 	struct sourcetable *tmp_sourcetable;	// sourcetable we are currently downloading
@@ -167,6 +171,11 @@ struct ntrip_state {
 						// contains "ntrip" (case-insensitive)
 	const char *user_agent;			// User-Agent header, if present
 	char wildcard;				// Flag: set for a source if the mountpoint is unregistered (wildcard entry)
+
+	unsigned long content_length;		// Content-Length received from the client, if any
+	unsigned long content_done;
+	char *content, *content_type;
+	char *query_string;			// HTTP GET query string, if any.
 
 	/*
 	 * Relevant sourceline if the connection is from a source.
@@ -205,6 +214,8 @@ void ntrip_free(struct ntrip_state *this, char *orig);
 void ntrip_deferred_free(struct ntrip_state *this, char *orig);
 void ntrip_deferred_run(struct caster_state *this);
 struct mime_content *ntrip_list_json(struct caster_state *caster);
+struct mime_content *ntrip_mem_json(struct caster_state *caster);
+struct mime_content *ntrip_reload_json(struct caster_state *caster);
 struct livesource *ntrip_add_livesource(struct ntrip_state *this, char *mountpoint, struct livesource **existing);
 void ntrip_unregister_livesource(struct ntrip_state *this);
 char *ntrip_peer_ipstr(struct ntrip_state *this);

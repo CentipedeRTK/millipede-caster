@@ -5,6 +5,8 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 
+#include <openssl/ssl.h>
+
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 
@@ -50,7 +52,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->last_send = time(NULL);
 	this->subscription = NULL;
 	this->server_version = 2;
-	this->client_version = 1;
+	this->client_version = 0;
 	this->source_virtual = 0;
 	this->source_on_demand = 0;
 	this->last_pos_valid = 0;
@@ -89,6 +91,12 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->remote = 0;
 	memset(&this->peeraddr, 0, sizeof(this->peeraddr));
 	this->counted = 0;
+	this->ssl = NULL;
+	this->content_length = 0;
+	this->content_done = 0;
+	this->content = NULL;
+	this->query_string = NULL;
+	this->content_type = NULL;
 	return this;
 }
 
@@ -203,6 +211,11 @@ static void _ntrip_free(struct ntrip_state *this, char *orig, int unlink) {
 	strfree(this->mountpoint);
 	strfree(this->virtual_mountpoint);
 	strfree(this->host);
+	strfree(this->content);
+	strfree(this->content_type);
+	strfree(this->query_string);
+
+	// this->ssl is freed by the bufferevent.
 
 	for (int i = 0; i < SIZE_HTTP_ARGS; i++) {
 		if (this->http_args[i])
@@ -454,6 +467,26 @@ struct mime_content *ntrip_list_json(struct caster_state *caster) {
 	json_object_put(new_list);
 	if (m == NULL)
 		strfree((char *)s);
+	return m;
+}
+
+/*
+ * Return memory stats.
+ */
+struct mime_content *ntrip_mem_json(struct caster_state *caster) {
+	struct mime_content *m = malloc_stats_dump(1);
+	return m;
+}
+
+/*
+ * Reload the configuration and return a status code.
+ */
+struct mime_content *ntrip_reload_json(struct caster_state *caster) {
+	char result[40];
+	int r = caster_reload(caster);
+	snprintf(result, sizeof result, "{\"result\": %d}\n", r);
+	char *s = mystrdup(result);
+	struct mime_content *m = mime_new(s, -1, "application/json", 1);
 	return m;
 }
 

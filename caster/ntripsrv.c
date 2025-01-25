@@ -30,8 +30,10 @@ send_server_reply(struct ntrip_state *this, struct evbuffer *ev,
 	evbuffer_add_printf(ev, "%s %d %s\r\n%sDate: %s\r\n", firstword, status_code, status, server_headers, date);
 	if (this->server_version == 2)
 		evbuffer_add_reference(ev, "Ntrip-Version: Ntrip/2.0\r\n", 26, NULL, NULL);
-	if (m)
+	if (m && m->mime_type)
 		evbuffer_add_printf(ev, "Content-Length: %lu\r\nContent-Type: %s\r\n", m->len, m->mime_type);
+	else if (m)
+		evbuffer_add_printf(ev, "Content-Length: %lu\r\n", m->len);
 	evbuffer_add_reference(ev, "Connection: close\r\n", 19, NULL, NULL);
 	if (headers) {
 		struct evkeyval *np;
@@ -288,12 +290,23 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 				} else if (!strcasecmp(key, "transfer-encoding")) {
 					if (!strcasecmp(value, "chunked"))
 						st->chunk_state = CHUNK_INIT;
+				} else if (!strcasecmp(key, "content-length")) {
+					unsigned long content_length;
+					if (sscanf(value, "%lu", &content_length) == 1) {
+						st->content_length = content_length;
+						st->content_done = 0;
+					}
+				} else if (!strcasecmp(key, "content-type")) {
+					st->content_type = mystrdup(value);
 				} else if (!strcasecmp(key, "ntrip-version")) {
 					if (!strcasecmp(value, "ntrip/2.0"))
 						st->client_version = 2;
 				} else if (!strcasecmp(key, "user-agent") || !strcasecmp(key, "source-agent")) {
-					if (mystrcasestr(value, "ntrip"))
+					if (mystrcasestr(value, "ntrip")) {
 						st->user_agent_ntrip = 1;
+						// Set NTRIP version to 1, unless it is already known to be 2.
+						if (!st->client_version) st->client_version = 1;
+					}
 					st->user_agent = mystrdup(value);
 				} else if (!strcasecmp(key, "authorization")) {
 					ntrip_log(st, LOG_DEBUG, "Header %s: *****\n", key);
@@ -319,6 +332,12 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					/* Don't log the password */
 					ntrip_alog(st, "%s *** %s\n", st->http_args[0], st->http_args[2]);
 				} else {
+					// Copy query string if any, clear from the request
+					char *querystring = strchr(st->http_args[1], '?');
+					if (querystring) {
+						st->query_string = mystrdup(querystring+1);
+						*querystring = '\0';
+					}
 					ntrip_alog(st, "%s %s %s\n", st->http_args[0], st->http_args[1], st->http_args[2]);
 				}
 				if (!strcmp(st->http_args[0], "GET")) {
@@ -326,13 +345,9 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						err = 400;
 						break;
 					}
-					char *querystring = strchr(st->http_args[1], '?');
-					if (querystring)
-						// Ignore query string
-						*querystring = '\0';
 					if (strlen(st->http_args[1]) >= 5 && !memcmp(st->http_args[1], "/adm/", 5)) {
 						st->type = "adm";
-						admsrv(st, "/adm", st->http_args[1] + 4, &err, &opt_headers);
+						admsrv(st, "GET", "/adm", st->http_args[1] + 4, &err, &opt_headers);
 						break;
 					}
 
@@ -400,9 +415,18 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					char *user;
 					char *mountpoint;
 
-					method_post_source = 1;
-
 					if (!strcmp(st->http_args[0], "POST")) {
+						if (strlen(st->http_args[1]) >= 5 && !memcmp(st->http_args[1], "/adm/", 5)) {
+							st->type = "adm";
+							st->content = (char *)strmalloc(st->content_length+1);
+							if (st->content == NULL && st->content_length) {
+								err = 503;
+								break;
+							}
+							st->state = NTRIP_WAIT_CLIENT_CONTENT;
+							continue;
+						}
+						method_post_source = 1;
 						password = st->password;
 						user = st->user;
 						st->client_version = 2;
@@ -412,6 +436,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						}
 						mountpoint = st->http_args[1]+1;
 					} else {
+						method_post_source = 1;
 						password = st->http_args[1];
 						user = NULL;
 						mountpoint = st->http_args[2];
@@ -472,6 +497,18 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 				st->last_pos = pos;
 				st->last_pos_valid = 1;
 				joblist_append_ntrip_locked(st->caster->joblist, st, &ntripsrv_redo_virtual_pos);
+			}
+		} else if (st->state == NTRIP_WAIT_CLIENT_CONTENT) {
+			int len;
+			len = evbuffer_remove(st->input, st->content+st->content_done, st->content_length-st->content_done);
+			if (len <= 0)
+				break;
+			st->content_done += len;
+			st->received_bytes += len;
+			if (st->content_done == st->content_length) {
+				st->content[st->content_length] = '\0';
+				admsrv(st, "POST", "/adm", st->http_args[1] + 4, &err, &opt_headers);
+				break;
 			}
 		} else if (st->state == NTRIP_WAIT_STREAM_SOURCE) {
 			if (!ntrip_handle_raw(st))
