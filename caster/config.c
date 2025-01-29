@@ -42,6 +42,8 @@ static struct config default_config = {
 	.sourcetable_fetch_timeout = 60,
 	.on_demand_source_timeout = 60,
 	.source_read_timeout = 60,
+	.ntripcli_default_read_timeout = 60,
+	.ntripcli_default_write_timeout = 60,
 	.ntripsrv_default_read_timeout = 60,
 	.ntripsrv_default_write_timeout = 60,
 	.access_log = "/var/log/millipede/access.log",
@@ -63,6 +65,13 @@ static struct config_bind default_config_bind = {
 static struct config_proxy default_config_proxy = {
 	.table_refresh_delay = 600,
 	.priority = 20
+};
+
+static struct config_graylog default_config_graylog = {
+	.bulk_max_size = 62000,
+	.queue_max_size = 4000000,
+	.retry_delay = 30,
+	.port = 7777
 };
 
 static struct config_threads default_config_threads = {
@@ -114,12 +123,45 @@ static const cyaml_schema_field_t proxy_fields_schema[] = {
 		"port", CYAML_FLAG_DEFAULT, struct config_proxy, port),
 	CYAML_FIELD_INT(
 		"priority", CYAML_FLAG_OPTIONAL, struct config_proxy, priority),
+	CYAML_FIELD_BOOL(
+		"tls", CYAML_FLAG_OPTIONAL, struct config_proxy, tls),
 	CYAML_FIELD_END
 };
 
 static const cyaml_schema_value_t proxy_schema = {
 	CYAML_VALUE_MAPPING(CYAML_FLAG_DEFAULT,
 		struct config_proxy, proxy_fields_schema),
+};
+
+static const cyaml_schema_field_t graylog_fields_schema[] = {
+	CYAML_FIELD_INT(
+		"retry_delay", CYAML_FLAG_OPTIONAL, struct config_graylog, retry_delay),
+	CYAML_FIELD_INT(
+		"bulk_max_size", CYAML_FLAG_OPTIONAL, struct config_graylog, bulk_max_size),
+	CYAML_FIELD_INT(
+		"queue_max_size", CYAML_FLAG_OPTIONAL, struct config_graylog, queue_max_size),
+	CYAML_FIELD_STRING_PTR(
+		"host", CYAML_FLAG_POINTER, struct config_graylog, host, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_INT(
+		"port", CYAML_FLAG_DEFAULT, struct config_graylog, port),
+	CYAML_FIELD_STRING_PTR(
+		"uri", CYAML_FLAG_POINTER, struct config_graylog, uri, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_BOOL(
+		"tls", CYAML_FLAG_OPTIONAL, struct config_graylog, tls),
+	CYAML_FIELD_STRING_PTR(
+		"authorization", CYAML_FLAG_POINTER, struct config_graylog, authorization, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_ENUM(
+			"log_level", CYAML_FLAG_DEFAULT,
+			struct config_graylog, log_level, log_level_strings,
+			CYAML_ARRAY_LEN(log_level_strings)),
+	CYAML_FIELD_STRING_PTR(
+		"drainfile", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL, struct config_graylog, drainfilename, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_END
+};
+
+static const cyaml_schema_value_t graylog_schema = {
+	CYAML_VALUE_MAPPING(CYAML_FLAG_DEFAULT,
+		struct config_graylog, graylog_fields_schema),
 };
 
 static const cyaml_schema_field_t threads_fields_schema[] = {
@@ -143,6 +185,9 @@ static const cyaml_schema_field_t top_mapping_schema[] = {
 	CYAML_FIELD_SEQUENCE(
 		"proxy", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL,
 		struct config, proxy, &proxy_schema, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_SEQUENCE(
+		"graylog", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL,
+		struct config, graylog, &graylog_schema, 0, 1),
 	CYAML_FIELD_STRING_PTR(
 		"source_auth_file", CYAML_FLAG_POINTER, struct config, source_auth_filename, 0, CYAML_UNLIMITED),
 	CYAML_FIELD_STRING_PTR(
@@ -163,6 +208,10 @@ static const cyaml_schema_field_t top_mapping_schema[] = {
 		"on_demand_source_timeout", CYAML_FLAG_OPTIONAL, struct config, on_demand_source_timeout),
 	CYAML_FIELD_INT(
 		"source_read_timeout", CYAML_FLAG_OPTIONAL, struct config, source_read_timeout),
+	CYAML_FIELD_INT(
+		"ntripcli_default_read_timeout", CYAML_FLAG_OPTIONAL, struct config, ntripcli_default_read_timeout),
+	CYAML_FIELD_INT(
+		"ntripcli_default_write_timeout", CYAML_FLAG_OPTIONAL, struct config, ntripcli_default_write_timeout),
 	CYAML_FIELD_INT(
 		"ntripsrv_default_read_timeout", CYAML_FLAG_OPTIONAL, struct config, ntripsrv_default_read_timeout),
 	CYAML_FIELD_INT(
@@ -219,6 +268,8 @@ struct config *config_parse(const char *filename) {
 	DEFAULT_ASSIGN(this, source_read_timeout);
 	DEFAULT_ASSIGN(this, backlog_socket);
 	DEFAULT_ASSIGN(this, backlog_evbuffer);
+	DEFAULT_ASSIGN(this, ntripcli_default_read_timeout);
+	DEFAULT_ASSIGN(this, ntripcli_default_write_timeout);
 	DEFAULT_ASSIGN(this, ntripsrv_default_read_timeout);
 	DEFAULT_ASSIGN(this, ntripsrv_default_write_timeout);
 	DEFAULT_ASSIGN(this, access_log);
@@ -226,6 +277,7 @@ struct config *config_parse(const char *filename) {
 	DEFAULT_ASSIGN(this, log_level);
 	DEFAULT_ASSIGN(this, admin_user);
 	DEFAULT_ASSIGN(this, sourcetable_priority);
+	DEFAULT_ASSIGN(this, sourcetable_fetch_timeout);
 
 	// Undocumented
 	DEFAULT_ASSIGN(this, disable_zero_copy);
@@ -239,6 +291,17 @@ struct config *config_parse(const char *filename) {
 			this->proxy[i].port = default_config_proxy.port;
 		if (this->proxy[i].priority == 0)
 			this->proxy[i].priority = default_config_proxy.priority;
+	}
+
+	for (int i = 0; i < this->graylog_count; i++) {
+		if (this->graylog[i].retry_delay == 0)
+			this->graylog[i].retry_delay = default_config_graylog.retry_delay;
+		if (this->graylog[i].port == 0)
+			this->graylog[i].port = default_config_graylog.port;
+		if (this->graylog[i].bulk_max_size == 0)
+			this->graylog[i].bulk_max_size = default_config_graylog.bulk_max_size;
+		if (this->graylog[i].queue_max_size == 0)
+			this->graylog[i].queue_max_size = default_config_graylog.queue_max_size;
 	}
 
 	for (int i = 0; i < this->bind_count; i++) {

@@ -17,6 +17,7 @@
 #include "queue.h"
 #include "sourcetable.h"
 #include "util.h"
+#include "graylog_sender.h"
 
 /*
  * Descriptor for a listener
@@ -28,6 +29,7 @@ struct listener {
 
 	int tls;			// is TLS activated?
 	SSL_CTX *ssl_server_ctx;	// TLS context, certs etc.
+	char *hostname;			// hostname for TLS/SNI
 };
 
 /*
@@ -61,6 +63,8 @@ struct caster_state {
 
 	struct prefix_table *blocklist;
 
+	SSL_CTX *ssl_client_ctx;	// TLS context for fetchers
+
 	/*
 	 * Live sources (currently received) related to this caster
 	 */
@@ -74,6 +78,9 @@ struct caster_state {
 
 	/* Logs */
 	struct log flog, alog;
+	char hostname[128];
+	struct graylog_sender **graylog;
+	int graylog_count;	/* 0 or 1 */
 
 	/* Thread id (thread-specific variable) for logs */
 	pthread_key_t thread_id;
@@ -92,6 +99,7 @@ struct caster_state {
 
 void caster_log_error(struct caster_state *this, char *orig);
 void caster_del_livesource(struct caster_state *this, struct livesource *livesource);
+int caster_tls_log_cb(const char *str, size_t len, void *u);
 int caster_main(char *config_file);
 void free_callback(const void *data, size_t datalen, void *extra);
 int caster_reload(struct caster_state *this);

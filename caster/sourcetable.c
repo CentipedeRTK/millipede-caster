@@ -2,7 +2,6 @@
 
 #include <assert.h>
 #include <ctype.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,7 +50,7 @@ struct sourcetable *sourcetable_read(const char *filename, int priority) {
 	return tmp_sourcetable;
 }
 
-struct sourcetable *sourcetable_new(char *host, unsigned short port) {
+struct sourcetable *sourcetable_new(const char *host, unsigned short port) {
 	struct sourcetable *this = (struct sourcetable *)malloc(sizeof(struct sourcetable));
 	char *duphost = (host == NULL) ? NULL : mystrdup(host);
 	char *header = mystrdup("");
@@ -195,7 +194,7 @@ int sourcetable_nentries(struct sourcetable *this, int omit_virtual) {
 	return r;
 }
 
-void sourcetable_diff(struct ntrip_state *st, struct sourcetable *t1, struct sourcetable *t2) {
+void sourcetable_diff(struct caster_state *caster, struct sourcetable *t1, struct sourcetable *t2) {
 	struct element **keys1, **keys2;
 	int n1, n2;
 	int i1, i2;
@@ -219,12 +218,12 @@ void sourcetable_diff(struct ntrip_state *st, struct sourcetable *t1, struct sou
 	while (i1 < n1 && i2 < n2) {
 		c = strcmp(keys1[i1]->key, keys2[i2]->key);
 		if (c < 0) {
-			ntrip_log(st, LOG_INFO, "Removed source %s\n", keys1[i1]->key);
+			logfmt(&caster->flog, LOG_INFO, "%s:%d Removed source %s", t1->caster, t1->port, keys1[i1]->key);
 			i1++;
 			continue;
 		}
 		if (c > 0) {
-			ntrip_log(st, LOG_INFO, "Added source %s\n", keys2[i2]->key);
+			logfmt(&caster->flog, LOG_INFO, "%s:%d Added source %s", t2->caster, t2->port, keys2[i2]->key);
 			i2++;
 			continue;
 		}
@@ -232,11 +231,11 @@ void sourcetable_diff(struct ntrip_state *st, struct sourcetable *t1, struct sou
 		i2++;
 	}
 	while (i1 < n1) {
-		ntrip_log(st, LOG_INFO, "Removed source %s\n", keys1[i1]->key);
+		logfmt(&caster->flog, LOG_INFO, "%s:%d Removed source %s", t1->caster, t1->port, keys1[i1]->key);
 		i1++;
 	}
 	while (i2 < n2) {
-		ntrip_log(st, LOG_INFO, "Added source %s\n", keys2[i2]->key);
+		logfmt(&caster->flog, LOG_INFO, "%s:%d Added source %s", t2->caster, t2->port, keys2[i2]->key);
 		i2++;
 	}
 	hash_array_free(keys1);
@@ -350,9 +349,9 @@ void dist_table_free(struct dist_table *this) {
 void dist_table_display(struct ntrip_state *st, struct dist_table *this, int max) {
 	float max_dist = this->size_dist_array ? this->dist_array[this->size_dist_array-1].dist : 40000;
 
-	ntrip_log(st, LOG_INFO, "dist_table from (%f, %f) %s:%d, furthest base dist %.2f:\n", this->pos.lat, this->pos.lon, this->sourcetable->caster, this->sourcetable->port, max_dist);
+	ntrip_log(st, LOG_INFO, "dist_table from (%f, %f) %s:%d, furthest base dist %.2f:", this->pos.lat, this->pos.lon, this->sourcetable->caster, this->sourcetable->port, max_dist);
 	for (int i = 0; i < max && i < this->size_dist_array; i++) {
-		ntrip_log(st, LOG_INFO, "%.2f: %s\n", this->dist_array[i].dist, this->dist_array[i].mountpoint);
+		ntrip_log(st, LOG_INFO, "%.2f: %s", this->dist_array[i].dist, this->dist_array[i].mountpoint);
 	}
 }
 
@@ -410,7 +409,7 @@ struct sourceline *stack_find_pullable(sourcetable_stack_t *stack, char *mountpo
  * Remove a sourcetable identified by host+port in the sourcetable stack.
  * Insert a new one instead, if new_sourcetable is not NULL.
  */
-void stack_replace_host(struct ntrip_state *st, sourcetable_stack_t *stack, char *host, unsigned port, struct sourcetable *new_sourcetable) {
+void stack_replace_host(struct caster_state *caster, sourcetable_stack_t *stack, char *host, unsigned port, struct sourcetable *new_sourcetable) {
 	struct sourcetable *s;
 	struct sourcetable *r = NULL;
 
@@ -429,7 +428,7 @@ void stack_replace_host(struct ntrip_state *st, sourcetable_stack_t *stack, char
 		TAILQ_REMOVE(&stack->list, r, next);
 		if (new_sourcetable != NULL) {
 			P_RWLOCK_UNLOCK(&r->lock);
-			sourcetable_diff(st, r, new_sourcetable);
+			sourcetable_diff(caster, r, new_sourcetable);
 			P_RWLOCK_WRLOCK(&r->lock);
 		}
 		sourcetable_free_unlocked(r);

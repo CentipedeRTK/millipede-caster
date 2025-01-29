@@ -14,6 +14,7 @@
 
 
 enum ntrip_session_state {
+	NTRIP_INIT,			// Only set by ntrip_new
 	NTRIP_WAIT_HTTP_METHOD,		// Wait for HTTP method (first request line)
 	NTRIP_WAIT_HTTP_STATUS,		// Wait for HTTP status (first reply line)
 	NTRIP_WAIT_HTTP_HEADER,		// Wait for HTTP header or empty line
@@ -21,11 +22,13 @@ enum ntrip_session_state {
 					// Ephemeral, immediately followed by NTRIP_WAIT_STREAM_GET
 	NTRIP_WAIT_STREAM_GET,		// Source connected, get data (client)
 	NTRIP_WAIT_STREAM_SOURCE,	// Source connected, receive data (server)
-	NTRIP_WAIT_SOURCETABLE_LINE,	// Client waiting for the next sourcetable line
+	NTRIP_WAIT_CALLBACK_LINE,	// Client waiting for the next callback line
 	NTRIP_WAIT_CLIENT_INPUT,	// Server waiting for GGA lines from client
 	NTRIP_WAIT_CLIENT_CONTENT,	// Server waiting for content
+	NTRIP_WAIT_SERVER_CONTENT,	// Client waiting for content
 	NTRIP_WAIT_CLOSE,		// End of connection, drain output then close
 	NTRIP_FORCE_CLOSE,		// End of connection, force close now
+	NTRIP_IDLE_CLIENT,		// client connection, waiting for something to send
 	NTRIP_END			// Ready for ntrip_free
 };
 
@@ -41,18 +44,6 @@ enum ntrip_chunk_state {
 	CHUNK_LAST,		// like CHUNK_WAITING_TRAILER, but last chunk
 	CHUNK_END		// finished, ready to be freed
 };
-
-/* Log levels, same as syslog and GEF + LOG_EDEBUG */
-
-#define	LOG_EMERG	0	/* system is unusable */
-#define	LOG_ALERT	1	/* action must be taken immediately */
-#define	LOG_CRIT	2	/* critical conditions */
-#define	LOG_ERR		3	/* error conditions */
-#define	LOG_WARNING	4	/* warning conditions */
-#define	LOG_NOTICE	5	/* normal but significant condition */
-#define	LOG_INFO	6	/* informational */
-#define	LOG_DEBUG	7	/* debug-level messages */
-#define	LOG_EDEBUG	8	/* extended debug messages */
 
 /*
  * Number of HTTP args.
@@ -123,6 +114,13 @@ struct ntrip_state {
 	int fd;					// file descriptor for the bufferevent
 	SSL *ssl;				// TLS state
 
+	char connection_keepalive;		// Flag: request that the connection stays open
+	char received_keepalive;		// Flag: received a keep-alive header from the other end
+	unsigned long content_length;		// Content-Length received from the other end, if any
+	unsigned long content_done;		// How many content bytes have been received
+	char *content;				// Received content
+	char *content_type;			// MIME type
+
 	struct {
 		struct evbuffer *raw_input;
 		bufferevent_filter_cb in_filter;
@@ -157,9 +155,9 @@ struct ntrip_state {
 	short client_version;			// NTRIP version in use: 0=plain HTTP, 1=NTRIP 1, 2=NTRIP 2
 	char *host;				// host to connect to
 	unsigned short port;			// port to connect to
-	struct sourcetable *tmp_sourcetable;	// sourcetable we are currently downloading
-	struct sourcetable_fetch_args *sourcetable_cb_arg;	// sourcetable download callback
+	struct ntrip_task *task;		// descriptor and callbacks for the current task
 	struct subscriber *subscription;	// current source subscription
+	char *uri;				// URI for requests
 
 	/*
 	 * NTRIP server state
@@ -172,9 +170,6 @@ struct ntrip_state {
 	const char *user_agent;			// User-Agent header, if present
 	char wildcard;				// Flag: set for a source if the mountpoint is unregistered (wildcard entry)
 
-	unsigned long content_length;		// Content-Length received from the client, if any
-	unsigned long content_done;
-	char *content, *content_type;
 	char *query_string;			// HTTP GET query string, if any.
 
 	/*
@@ -205,7 +200,8 @@ struct ntrip_state {
 	char *virtual_mountpoint;
 };
 
-struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *bev, char *host, unsigned short port, char *mountpoint);
+struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *bev,
+	char *host, unsigned short port, const char *uri, char *mountpoint);
 void ntrip_register(struct ntrip_state *this);
 int ntrip_register_check(struct ntrip_state *this);
 void ntrip_set_fd(struct ntrip_state *this);

@@ -2,8 +2,10 @@
 #define __UTIL_H__
 
 #include <sys/types.h>
+#include <sys/queue.h>
 
 #include "conf.h"
+#include "log.h"
 
 
 // Geographical position
@@ -39,11 +41,13 @@ struct auth_entry {
  * Content with a MIME type
  */
 struct mime_content {
+	STAILQ_ENTRY(mime_content) next;	// optional queue
 	char *s;
 	const char *mime_type;
 	size_t len;
 	int use_strfree;
 };
+STAILQ_HEAD(mimeq, mime_content);
 
 #if !DEBUG
 #define strfree free
@@ -74,9 +78,10 @@ void mime_set_type(struct mime_content *this, const char *mime_type);
 void mime_free(struct mime_content *this);
 void mime_append(struct mime_content *this, const char *s);
 void iso_date_from_timeval(char *iso_date, size_t iso_date_len, struct timeval *t);
-struct parsed_file *file_parse(const char *filename, int nfields, const char *seps, int skipempty);
+struct parsed_file *file_parse(const char *filename, int nfields, const char *seps, int skipempty, struct log *log);
 void file_free(struct parsed_file *p);
-void logdate(char *date, size_t len);
+void logdate(char *date, size_t len, struct timeval *ts);
+void filedate(char *filename, size_t len, const char *format);
 
 char *mystrcasestr(const char *s, const char *find);
 

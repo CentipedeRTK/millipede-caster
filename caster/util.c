@@ -1,6 +1,5 @@
 #include <arpa/inet.h>
 #include <math.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/cdefs.h>
@@ -13,6 +12,7 @@
 #endif
 
 #include "conf.h"
+#include "log.h"
 #include "util.h"
 
 /*
@@ -540,7 +540,7 @@ static string_array_t *split(const char *s, char sep, int maxsplits) {
  * Read a file with fields separated by characters in seps.
  * Skip empty fields if skipempty is not 0.
  */
-struct parsed_file *file_parse(const char *filename, int nfields, const char *seps, const int skipempty) {
+struct parsed_file *file_parse(const char *filename, int nfields, const char *seps, const int skipempty, struct log *log) {
 	char *line = NULL;
 	size_t linecap = 0;
 	ssize_t linelen;
@@ -551,7 +551,7 @@ struct parsed_file *file_parse(const char *filename, int nfields, const char *se
 	FILE *fp = fopen(filename, "r+");
 
 	if (fp == NULL) {
-		fprintf(stderr, "Can't open %s\n", filename);
+		logfmt(log, LOG_ERR, "Can't open %s", filename);
 		return NULL;
 	}
 
@@ -560,7 +560,7 @@ struct parsed_file *file_parse(const char *filename, int nfields, const char *se
 	pf->filename = mystrdup(filename);
 	if (pf->filename == NULL) {
 		fclose(fp);
-		fprintf(stderr, "Can't read %s\n", filename);
+		logfmt(log, LOG_ERR, "Can't read %s", filename);
 		return NULL;
 	}
 
@@ -606,7 +606,7 @@ struct parsed_file *file_parse(const char *filename, int nfields, const char *se
 			}
 		}
 		if (n != nfields) {
-			fprintf(stderr, "Invalid line %d in %s\n", nlines+1, filename);
+			logfmt(log, LOG_ERR, "Invalid line %d in %s", nlines+1, filename);
 			break;
 		}
 	}
@@ -632,14 +632,20 @@ void file_free(struct parsed_file *p) {
 	free(p);
 }
 
-void logdate(char *date, size_t len) {
+void logdate(char *date, size_t len, struct timeval *ts) {
 	char tmp_date[30];
-	struct timeval tstamp;
-	gettimeofday(&tstamp, NULL);
 	struct tm t;
-	localtime_r(&tstamp.tv_sec, &t);
+	localtime_r(&ts->tv_sec, &t);
 	strftime(tmp_date, sizeof tmp_date, "%Y-%m-%d %H:%M:%S", &t);
-	snprintf(date, len, "%s.%03ld ", tmp_date, tstamp.tv_usec/1000);
+	snprintf(date, len, "%s.%03ld", tmp_date, ts->tv_usec/1000);
+}
+
+void filedate(char *filename, size_t len, const char *format) {
+	struct tm t;
+	struct timeval ts;
+	gettimeofday(&ts, NULL);
+	localtime_r(&ts.tv_sec, &t);
+	strftime(filename, len, format, &t);
 }
 
 /*

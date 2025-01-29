@@ -40,6 +40,36 @@ struct config_proxy {
 	 * Higher = better priority
 	 */
 	int priority;
+	int tls;
+};
+
+struct config_graylog {
+	/*
+	 * Configuration for a graylog server
+	 */
+	char *host;
+	unsigned short port;
+
+	/* URI on the server */
+	const char *uri;
+
+	int tls;
+	int log_level;
+
+	/* Token for Authorization: HTTP header */
+	char *authorization;
+
+	/* How many seconds to wait before restarting a failed connection */
+	int retry_delay;
+
+	/* Maximum size for bulk mode, 0 to disable bulk mode */
+	size_t bulk_max_size;
+
+	/* Maximum queue size for memory backlog */
+	size_t queue_max_size;
+
+	/* File template (see strftime(3)) for overflow files */
+	char *drainfilename;
 };
 
 struct config_threads {
@@ -60,6 +90,12 @@ struct config {
 	int			proxy_count;
 
 	/*
+	 * Graylog server definition
+	 */
+	struct config_graylog	*graylog;
+	int			graylog_count;
+
+	/*
 	 * Sizes of accepted backlogs before we drop a client.
 	 */
 	size_t			backlog_socket;		// used to set the socket buffer size
@@ -69,6 +105,13 @@ struct config {
 	 * Read timeout for sources
 	 */
 	int			source_read_timeout;
+
+	/*
+	 * Default timeouts for ntripcli and ntripsrv,
+	 * unless otherwise specified by specific tasks.
+	 */
+	int			ntripcli_default_read_timeout;
+	int			ntripcli_default_write_timeout;
 	int			ntripsrv_default_read_timeout;
 	int			ntripsrv_default_write_timeout;
 
