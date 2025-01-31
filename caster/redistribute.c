@@ -147,6 +147,7 @@ redistribute_source_stream(struct redistribute_cb_args *redis_args) {
 	st->type = "source_fetcher";
 	st->redistribute = 1;
 	st->persistent = redis_args->persistent;
+	st->client = 1;
 	redis_args->source_st = st;
 	ntrip_register(st);
 
@@ -158,9 +159,9 @@ redistribute_source_stream(struct redistribute_cb_args *redis_args) {
 		bufferevent_setcb(bev, ntripcli_readcb, ntripcli_writecb, ntripcli_eventcb, st);
 
 	bufferevent_enable(bev, EV_READ|EV_WRITE);
-        struct timeval read_timeout = { st->caster->config->on_demand_source_timeout, 0 };
-        struct timeval write_timeout = { st->caster->config->on_demand_source_timeout, 0 };
-        bufferevent_set_timeouts(bev, &read_timeout, &write_timeout);
+	struct timeval read_timeout = { st->caster->config->on_demand_source_timeout, 0 };
+	struct timeval write_timeout = { st->caster->config->on_demand_source_timeout, 0 };
+	bufferevent_set_timeouts(bev, &read_timeout, &write_timeout);
 	bufferevent_socket_connect_hostname(bev, redis_args->caster->dns_base, AF_UNSPEC, st->host, st->port);
 
 	redistribute_args_free(redis_args);

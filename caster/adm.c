@@ -7,8 +7,8 @@
 
 #include "conf.h"
 #include "adm.h"
+#include "api.h"
 #include "hash.h"
-#include "ntrip_common.h"
 #include "ntripsrv.h"
 
 int admsrv(struct ntrip_state *st, const char *method, const char *root_uri, const char *uri, int *err, struct evkeyvalq *headers) {
@@ -66,18 +66,19 @@ int admsrv(struct ntrip_state *st, const char *method, const char *root_uri, con
 		 * Run API calls
 		 */
 		if (!strcmp(uri, "/api/v1/net") && !strcmp(method, "GET")) {
-			hash_table_free(h);
-			joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, ntrip_list_json);
+			joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, api_ntrip_list_json, h);
 			return 0;
 		}
 		if (!strcmp(uri, "/api/v1/mem") && !strcmp(method, "GET")) {
-			hash_table_free(h);
-			joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, ntrip_mem_json);
+			joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, api_mem_json, h);
 			return 0;
 		}
 		if (!strcmp(uri, "/api/v1/reload") && !strcmp(method, "POST")) {
-			hash_table_free(h);
-			joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, ntrip_reload_json);
+			joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, api_reload_json, h);
+			return 0;
+		}
+		if (!strcmp(uri, "/api/v1/drop") && !strcmp(method, "POST")) {
+			joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, api_drop_json, h);
 			return 0;
 		}
 
@@ -121,7 +122,7 @@ int admsrv(struct ntrip_state *st, const char *method, const char *root_uri, con
 		st->state = NTRIP_WAIT_CLOSE;
 		return 0;
 	} else if (!strcmp(uri, "/net")) {
-		joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, ntrip_list_json);
+		joblist_append_ntrip_unlocked_content(st->caster->joblist, ntripsrv_deferred_output, st, api_ntrip_list_json, NULL);
 		return 0;
 	} else {
 		*err = 404;

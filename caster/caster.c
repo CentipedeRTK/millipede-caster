@@ -120,14 +120,14 @@ _caster_log(struct caster_state *caster, struct gelf_entry *g, struct log *log, 
 	vasprintf(&msg, fmt, ap);
 
 	if (level <= caster->config->log_level)
-		logfmt_direct(log, g, level, "%s %s\n", date, msg);
+		logfmt_direct(log, "%s %s\n", date, msg);
 
 	if (g->short_message == NULL)
 		g->short_message = msg;
 	else
 		free(msg);
 
-	if (caster->graylog && caster->graylog[0] && !g->nograylog && level <= caster->config->graylog[0].log_level) {
+	if (level != -1 && caster->graylog && caster->graylog[0] && !g->nograylog && level <= caster->config->graylog[0].log_level) {
 		json_object *j = gelf_json(g);
 		char *s = mystrdup(json_object_to_json_string(j));
 		json_object_put(j);
@@ -139,6 +139,10 @@ _caster_log(struct caster_state *caster, struct gelf_entry *g, struct log *log, 
 	g->short_message = NULL;
 }
 
+/*
+ * Caster access log.
+ * level -1 => not sent to graylog.
+ */
 static void
 caster_alog(void *arg, struct gelf_entry *g, int dummy, const char *fmt, va_list ap) {
 	struct caster_state *this = (struct caster_state *)arg;
@@ -561,15 +565,18 @@ static int caster_reload_listeners(struct caster_state *this) {
 	return 0;
 }
 
-void caster_del_livesource(struct caster_state *this, struct livesource *livesource) {
+int caster_del_livesource(struct caster_state *this, struct livesource *livesource) {
+	int r = 0;
 	P_MUTEX_LOCK(&this->livesources.delete_lock);
 	P_RWLOCK_WRLOCK(&this->livesources.lock);
 
 	TAILQ_REMOVE(&this->livesources.queue, livesource, next);
 	livesource_free(livesource);
+	r = 1;
 
 	P_RWLOCK_UNLOCK(&this->livesources.lock);
 	P_MUTEX_UNLOCK(&this->livesources.delete_lock);
+	return r;
 }
 
 static int
@@ -743,7 +750,9 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	}
 
 	st->ssl = ssl;
+	st->bev_close_on_free = 1;
 	ntrip_set_peeraddr(st, sa, socklen);
+	ntrip_set_localaddr(st);
 
 	st->state = NTRIP_WAIT_HTTP_METHOD;
 

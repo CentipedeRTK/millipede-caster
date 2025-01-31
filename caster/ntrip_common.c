@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <string.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 
@@ -10,14 +10,11 @@
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 
-#include <json-c/json.h>
-
 #include "conf.h"
 #include "caster.h"
 #include "log.h"
 #include "livesource.h"
 #include "ntrip_common.h"
-#include "util.h"
 
 /*
  * Create a NTRIP session state for a client or a server connection.
@@ -71,6 +68,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->njobs = 0;
 	this->newjobs = 0;
 	this->bev_freed = 0;
+	this->bev_close_on_free = 0;
 	this->bev = bev;
 
 	// Explicitly copied to avoid locking issues later with bufferevent_getfd()
@@ -88,9 +86,15 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->status_code = 0;
 	this->id = 0;
 	memset(&this->http_args, 0, sizeof(this->http_args));
+
 	this->remote_addr[0] = '\0';
 	this->remote = 0;
 	memset(&this->peeraddr, 0, sizeof(this->peeraddr));
+
+	this->local_addr[0] = '\0';
+	this->local = 0;
+	memset(&this->myaddr, 0, sizeof(this->myaddr));
+
 	this->counted = 0;
 	this->ssl = NULL;
 	this->content_length = 0;
@@ -98,6 +102,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->content = NULL;
 	this->query_string = NULL;
 	this->content_type = NULL;
+	this->client = 0;
 	return this;
 }
 
@@ -192,9 +197,51 @@ void ntrip_set_peeraddr(struct ntrip_state *this, struct sockaddr *sa, size_t so
 	ip_str(&this->peeraddr, this->remote_addr, sizeof this->remote_addr);
 }
 
+void ntrip_set_localaddr(struct ntrip_state *this) {
+	socklen_t psocklen = sizeof(this->myaddr);
+	if (getsockname(this->fd, &this->myaddr.generic, &psocklen) < 0) {
+		ntrip_log(this, LOG_NOTICE, "getsockname failed: %s", strerror(errno));
+		return;
+	}
+	this->local = 1;
+	ip_str(&this->myaddr, this->local_addr, sizeof this->local_addr);
+}
+
 static void my_bufferevent_free(struct ntrip_state *this, struct bufferevent *bev) {
 	if (!this->bev_freed) {
 		ntrip_log(this, LOG_EDEBUG, "bufferevent_free %p", bev);
+		if (this->bev_close_on_free) {
+			/*
+			 * We have to cleanup this bufferevent "by hand" in cases
+			 * where BEV_OPT_CLOSE_ON_FREE doesn't apply.
+			 */
+			int r = bufferevent_flush(this->bev, EV_WRITE, BEV_FINISHED);
+			if (r < 0)
+				ntrip_log(this, LOG_DEBUG, "bufferevent_flush err");
+			bufferevent_disable(this->bev, EV_READ|EV_WRITE);
+			bufferevent_set_timeouts(this->bev, NULL, NULL);
+			bufferevent_setcb(this->bev, NULL, NULL, NULL, NULL);
+
+			/*
+			 * The following is crucial to work around a libevent bug
+			 * with pending timeouts applying on the next use of the
+			 * file descriptor, closing innocent random connections
+			 * reusing the fd.
+			 *
+			 * Setting it to -1 ensures this doesn't happen.
+			 *
+			 * Clearing the timeouts and callbacks as done above doesn't
+			 * seem to be enough.
+			 */
+			bufferevent_setfd(this->bev, -1);
+
+			/*
+			 * Log close() failures (typically EBADF), which are an early sign
+			 * of something amiss.
+			 */
+			if (close(this->fd) < 0)
+				ntrip_log(this, LOG_NOTICE, "CLOSE fd %d err %d", this->fd, errno);
+		}
 		bufferevent_free(bev);
 		this->bev_freed = 1;
 	} else
@@ -391,104 +438,6 @@ void ntrip_deferred_run(struct caster_state *this) {
 		logfmt(&this->flog, LOG_INFO, "ntrip_deferred_run did %d ntrip_free", n);
 }
 
-static json_object *ntrip_json(struct ntrip_state *st) {
-        bufferevent_lock(st->bev);
-
-	char *ipstr = st->remote_addr;
-	json_object *jsonip;
-	unsigned port = ip_port(&st->peeraddr);
-	jsonip = ipstr[0] ? json_object_new_string(ipstr) : json_object_new_null();
-	json_object *new_obj = json_object_new_object();
-	json_object *jsonid = json_object_new_int64(st->id);
-	json_object *received_bytes = json_object_new_int64(st->received_bytes);
-	json_object *sent_bytes = json_object_new_int64(st->sent_bytes);
-	json_object *jsonport = json_object_new_int(port);
-	json_object_object_add(new_obj, "id", jsonid);
-	json_object_object_add(new_obj, "received_bytes", received_bytes);
-	json_object_object_add(new_obj, "sent_bytes", sent_bytes);
-	json_object_object_add(new_obj, "ip", jsonip);
-	json_object_object_add(new_obj, "port", jsonport);
-	json_object_object_add(new_obj, "type", json_object_new_string(st->type));
-	json_object_object_add(new_obj, "wildcard", json_object_new_boolean(st->wildcard));
-	if (!strcmp(st->type, "source") || !strcmp(st->type, "source_fetcher"))
-		json_object_object_add(new_obj, "mountpoint", json_object_new_string(st->mountpoint));
-	else if (!strcmp(st->type, "client"))
-		json_object_object_add(new_obj, "mountpoint", json_object_new_string(st->http_args[1]+1));
-
-	if (st->user_agent)
-		json_object_object_add(new_obj, "user-agent", json_object_new_string(st->user_agent));
-
-	struct tcp_info ti;
-	socklen_t ti_len = sizeof ti;
-	if (getsockopt(st->fd, IPPROTO_TCP, TCP_INFO, &ti, &ti_len) >= 0) {
-		json_object *tcpi_obj = json_object_new_object();
-		json_object_object_add(tcpi_obj, "rtt", json_object_new_int64(ti.tcpi_rtt));
-		json_object_object_add(tcpi_obj, "rttvar", json_object_new_int64(ti.tcpi_rttvar));
-		json_object_object_add(tcpi_obj, "snd_mss", json_object_new_int64(ti.tcpi_snd_mss));
-		json_object_object_add(tcpi_obj, "rcv_mss", json_object_new_int64(ti.tcpi_rcv_mss));
-		json_object_object_add(tcpi_obj, "last_data_recv", json_object_new_int64(ti.tcpi_last_data_recv));
-		json_object_object_add(tcpi_obj, "rcv_wnd", json_object_new_int64(ti.tcpi_rcv_space));
-#ifdef __FreeBSD__
-		// FreeBSD-specific
-		json_object_object_add(tcpi_obj, "snd_wnd", json_object_new_int64(ti.tcpi_snd_wnd));
-		json_object_object_add(tcpi_obj, "snd_rexmitpack", json_object_new_int64(ti.tcpi_snd_rexmitpack));
-#endif
-		json_object_object_add(new_obj, "tcp_info", tcpi_obj);
-	}
-
-	char iso_date[30];
-	iso_date_from_timeval(iso_date, sizeof iso_date, &st->start);
-	json_object_object_add(new_obj, "start", json_object_new_string(iso_date));
-
-        bufferevent_unlock(st->bev);
-	return new_obj;
-}
-
-/*
- * Return a list of ntrip_state as a JSON object.
- */
-struct mime_content *ntrip_list_json(struct caster_state *caster) {
-	char *s;
-	json_object *new_list = json_object_new_object();
-	struct ntrip_state *sst;
-
-	P_RWLOCK_RDLOCK(&caster->ntrips.lock);
-	TAILQ_FOREACH(sst, &caster->ntrips.queue, nextg) {
-		char idstr[40];
-		json_object *nj = ntrip_json(sst);
-		snprintf(idstr, sizeof idstr, "%lld", sst->id);
-		json_object_object_add(new_list, idstr, nj);
-	}
-	P_RWLOCK_UNLOCK(&caster->ntrips.lock);
-
-	s = mystrdup(json_object_to_json_string(new_list));
-	struct mime_content *m = mime_new(s, -1, "application/json", 1);
-	json_object_put(new_list);
-	if (m == NULL)
-		strfree((char *)s);
-	return m;
-}
-
-/*
- * Return memory stats.
- */
-struct mime_content *ntrip_mem_json(struct caster_state *caster) {
-	struct mime_content *m = malloc_stats_dump(1);
-	return m;
-}
-
-/*
- * Reload the configuration and return a status code.
- */
-struct mime_content *ntrip_reload_json(struct caster_state *caster) {
-	char result[40];
-	int r = caster_reload(caster);
-	snprintf(result, sizeof result, "{\"result\": %d}\n", r);
-	char *s = mystrdup(result);
-	struct mime_content *m = mime_new(s, -1, "application/json", 1);
-	return m;
-}
-
 /*
  * Required lock: ntrip_state
  * Acquires lock: livesources
@@ -536,11 +485,34 @@ void ntrip_unregister_livesource(struct ntrip_state *this) {
 	this->own_livesource = NULL;
 }
 
-char *ntrip_peer_ipstr(struct ntrip_state *this) {
-	char *r;
-	char inetaddr[64];
-	r = ip_str(&this->peeraddr, inetaddr, sizeof inetaddr);
-	return r?mystrdup(r):NULL;
+/*
+ * Notify users of a connection that it is closing.
+ *
+ * Required lock: ntrip_state
+ */
+void ntrip_notify_close(struct ntrip_state *st) {
+
+	/*
+	 * Superfluous check, might be needed later in case some fields
+	 * of ntrip_state are placed in a union to save space.
+	 */
+	if (!st->client)
+		return;
+
+	if (st->task != NULL) {
+		/* Notify the callback the transfer is over, and failed. */
+		st->task->end_cb(0, st->task->end_cb_arg);
+		st->task = NULL;
+	}
+	if (st->own_livesource) {
+		if (st->redistribute && st->persistent) {
+			struct redistribute_cb_args *redis_args;
+			redis_args = redistribute_args_new(st->caster, st->own_livesource, st->mountpoint, &st->mountpoint_pos, st->caster->config->reconnect_delay, 0);
+			if (redis_args)
+				redistribute_schedule(st->caster, st, redis_args);
+		} else
+			ntrip_unregister_livesource(st);
+	}
 }
 
 unsigned short ntrip_peer_port(struct ntrip_state *this) {
@@ -679,14 +651,14 @@ static enum bufferevent_filter_result ntrip_chunk_decode(struct evbuffer *input,
 	while (1) {
 		len_raw = evbuffer_get_length(input);
 		if (len_raw <= 0) {
-			ntrip_log(st, LOG_DEBUG, "ntrip_chunk_decode OK/MORE done %d", len_done);
+			ntrip_log(st, LOG_EDEBUG, "ntrip_chunk_decode OK/MORE done %d", len_done);
 			return len_done?BEV_OK:BEV_NEED_MORE;
 		}
 
 		if (st->chunk_state == CHUNK_WAIT_LEN) {
 			char *line = evbuffer_readln(input, &len, EVBUFFER_EOL_CRLF_STRICT);
 			if (line == NULL) {
-				ntrip_log(st, LOG_DEBUG, "ntrip_chunk_decode readln failed, OK/MORE done %d", len_done);
+				ntrip_log(st, LOG_EDEBUG, "ntrip_chunk_decode readln failed, OK/MORE done %d", len_done);
 				return len_done?BEV_OK:BEV_NEED_MORE;
 			}
 
@@ -699,7 +671,7 @@ static enum bufferevent_filter_result ntrip_chunk_decode(struct evbuffer *input,
 				free(line);
 				st->state = NTRIP_FORCE_CLOSE;
 				st->chunk_state = CHUNK_NONE;
-				ntrip_log(st, LOG_DEBUG, "ntrip_chunk_decode OK/ERROR done %d", len_done);
+				ntrip_log(st, LOG_EDEBUG, "ntrip_chunk_decode OK/ERROR done %d", len_done);
 				return len_done?BEV_OK:BEV_ERROR;
 			}
 			free(line);
@@ -729,7 +701,7 @@ static enum bufferevent_filter_result ntrip_chunk_decode(struct evbuffer *input,
 		} else if (st->chunk_state == CHUNK_WAITING_TRAILER || st->chunk_state == CHUNK_LAST) {
 			char data[2];
 			if (len_raw < 2) {
-				ntrip_log(st, LOG_DEBUG, "ntrip_chunk_decode OK/MORE done %d", len_done);
+				ntrip_log(st, LOG_EDEBUG, "ntrip_chunk_decode OK/MORE done %d", len_done);
 				return len_done?BEV_OK:BEV_NEED_MORE;
 			}
 			// skip trailing CR LF
@@ -740,7 +712,7 @@ static enum bufferevent_filter_result ntrip_chunk_decode(struct evbuffer *input,
 			if (st->chunk_state == CHUNK_LAST) {
 				st->state = NTRIP_FORCE_CLOSE;
 				st->chunk_state = CHUNK_END;
-				ntrip_log(st, LOG_DEBUG, "ntrip_chunk_decode 0-length done %d, closing", len_done);
+				ntrip_log(st, LOG_EDEBUG, "ntrip_chunk_decode 0-length done %d, closing", len_done);
 				return BEV_OK;
 			}
 			st->chunk_state = CHUNK_WAIT_LEN;

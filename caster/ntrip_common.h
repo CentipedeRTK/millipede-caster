@@ -7,6 +7,7 @@
 
 #include "conf.h"
 #include "caster.h"
+#include "hash.h"
 #include "ip.h"
 #include "livesource.h"
 #include "redistribute.h"
@@ -104,12 +105,18 @@ struct ntrip_state {
 	// Linked-list entry for the caster->ntrips.free_queue
 	TAILQ_ENTRY(ntrip_state) nextf;
 
+	// Flag: is this a client (outgoing) or a server (incoming) connection?
+	char client;
+
 	/*
 	 * State for a NTRIP client or server
 	 */
 
 	struct bufferevent *bev;		// main bufferevent associated with the session
 	char bev_freed;				// has it been freed already?
+	char bev_close_on_free;			// do we have to close() the file descriptor
+						// at bufferevent_free()? libevent can't do it
+						// for accept()'ed sockets.
 	struct evbuffer *input;
 	int fd;					// file descriptor for the bufferevent
 	SSL *ssl;				// TLS state
@@ -137,6 +144,9 @@ struct ntrip_state {
 	char counted;				// Flag: counted in IP quotas
 	union sock peeraddr;
 	char remote_addr[40];		// Conversion of the IP address part to an ASCII string
+	char local;			// Flag: local address is filled in localaddr
+	union sock myaddr;
+	char local_addr[40];		// Conversion of the IP address part to an ASCII string
 
 	char *http_args[SIZE_HTTP_ARGS];
 
@@ -206,15 +216,13 @@ void ntrip_register(struct ntrip_state *this);
 int ntrip_register_check(struct ntrip_state *this);
 void ntrip_set_fd(struct ntrip_state *this);
 void ntrip_set_peeraddr(struct ntrip_state *this, struct sockaddr *sa, size_t socklen);
+void ntrip_set_localaddr(struct ntrip_state *this);
 void ntrip_free(struct ntrip_state *this, char *orig);
 void ntrip_deferred_free(struct ntrip_state *this, char *orig);
 void ntrip_deferred_run(struct caster_state *this);
-struct mime_content *ntrip_list_json(struct caster_state *caster);
-struct mime_content *ntrip_mem_json(struct caster_state *caster);
-struct mime_content *ntrip_reload_json(struct caster_state *caster);
 struct livesource *ntrip_add_livesource(struct ntrip_state *this, char *mountpoint, struct livesource **existing);
 void ntrip_unregister_livesource(struct ntrip_state *this);
-char *ntrip_peer_ipstr(struct ntrip_state *this);
+void ntrip_notify_close(struct ntrip_state *st);
 unsigned short ntrip_peer_port(struct ntrip_state *this);
 void ntrip_alog(void *arg, const char *fmt, ...);
 void ntrip_log(void *arg, int level, const char *fmt, ...);

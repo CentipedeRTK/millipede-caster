@@ -15,7 +15,6 @@
 #include "ntripcli.h"
 #include "ntrip_common.h"
 #include "ntrip_task.h"
-#include "redistribute.h"
 #include "util.h"
 
 const char *client_ntrip_version = "Ntrip/2.0";
@@ -326,13 +325,9 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 		}
 	}
 	if (end || st->state == NTRIP_FORCE_CLOSE) {
-		if (st->task != NULL) {
-			/* Notify the callback the transfer is over, and failed. */
-			st->task->end_cb(0, st->task->end_cb_arg);
-			st->task = NULL;
-		}
+		ntrip_notify_close(st);
 		ntripcli_log_close(st);
-		ntrip_deferred_free(st, "ntripcli_readcb/sourcetable");
+		ntrip_deferred_free(st, "ntripcli_readcb");
 	}
 }
 
@@ -374,6 +369,7 @@ void ntripcli_eventcb(struct bufferevent *bev, short events, void *arg) {
 		ntrip_set_fd(st);
 
 		ntrip_set_peeraddr(st, NULL, 0);
+		ntrip_set_localaddr(st);
 		ntrip_log(st, LOG_INFO, "Connected to %s:%d for %s", st->host, st->port, st->uri);
 		if (st->task && st->task->use_mimeq) {
 			st->state = NTRIP_IDLE_CLIENT;
@@ -394,20 +390,7 @@ void ntripcli_eventcb(struct bufferevent *bev, short events, void *arg) {
 			ntrip_log(st, LOG_NOTICE, "ntripcli write timeout");
 	}
 
-	if (st->own_livesource) {
-		if (st->redistribute && st->persistent) {
-			struct redistribute_cb_args *redis_args;
-			redis_args = redistribute_args_new(st->caster, st->own_livesource, st->mountpoint, &st->mountpoint_pos, st->caster->config->reconnect_delay, 0);
-			if (redis_args)
-				redistribute_schedule(st->caster, st, redis_args);
-		} else
-			ntrip_unregister_livesource(st);
-	}
-	if (st->task != NULL) {
-		/* Notify the callback the transfer is over, and failed. */
-		st->task->end_cb(0, st->task->end_cb_arg);
-		st->task = NULL;
-	}
+	ntrip_notify_close(st);
 	ntripcli_log_close(st);
 	ntrip_deferred_free(st, "ntripcli_eventcb");
 }
@@ -461,6 +444,7 @@ ntripcli_start(struct caster_state *caster, char *host, unsigned short port, int
 	st->type = type;
 	st->task = task;
 	st->ssl = ssl;
+	st->client = 1;
 
 	ntrip_register(st);
 	ntrip_log(st, LOG_NOTICE, "Starting %s from %s:%d", type, host, port);
