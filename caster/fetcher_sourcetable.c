@@ -132,9 +132,9 @@ void
 fetcher_sourcetable_start(void *arg_cb) {
 	struct sourcetable_fetch_args *a = (struct sourcetable_fetch_args *)arg_cb;
 	assert(a->sourcetable == NULL);
-	a->sourcetable = sourcetable_new(a->task->host, a->task->port);
+	a->sourcetable = sourcetable_new(a->task->host, a->task->port, a->task->tls);
 
-	if (ntripcli_start(a->task->caster, a->task->host, a->task->port, a->task->tls, a->task->uri, a->task->type, a->task) < 0) {
+	if (ntripcli_start(a->task->caster, a->task->host, a->task->port, a->task->tls, a->task->uri, a->task->type, a->task, NULL, 0) < 0) {
 		sourcetable_free(a->sourcetable);
 		a->sourcetable = NULL;
 		a->task->st = NULL;

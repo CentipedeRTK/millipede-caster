@@ -77,7 +77,6 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->input = bufferevent_get_input(bev);
 	this->filter.in_filter = NULL;
 	this->filter.raw_input = this->input;
-	this->redistribute = 0;
 	this->persistent = 0;
 	this->task = NULL;
 	this->subscription = NULL;
@@ -504,15 +503,6 @@ void ntrip_notify_close(struct ntrip_state *st) {
 		st->task->end_cb(0, st->task->end_cb_arg);
 		st->task = NULL;
 	}
-	if (st->own_livesource) {
-		if (st->redistribute && st->persistent) {
-			struct redistribute_cb_args *redis_args;
-			redis_args = redistribute_args_new(st->caster, st->own_livesource, st->mountpoint, &st->mountpoint_pos, st->caster->config->reconnect_delay, 0);
-			if (redis_args)
-				redistribute_schedule(st->caster, st, redis_args);
-		} else
-			ntrip_unregister_livesource(st);
-	}
 }
 
 unsigned short ntrip_peer_port(struct ntrip_state *this) {
@@ -532,6 +522,7 @@ _ntrip_log(struct log *log, struct ntrip_state *this, int level, const char *fmt
 	struct gelf_entry g;
 	int thread_id;
 	char addrport[64];
+	char addr[40];
 
 	thread_id = threads?(long)pthread_getspecific(this->caster->thread_id):-1;
 	gelf_init(&g, level, this->caster->hostname, thread_id);
@@ -543,7 +534,9 @@ _ntrip_log(struct log *log, struct ntrip_state *this, int level, const char *fmt
 	if (this->remote) {
 		unsigned port = ntrip_peer_port(this);
 		struct sockaddr *sa = &this->peeraddr.generic;
-		g.addrport = addrport;
+		g.remote_ip = addr;
+		g.remote_port = port;
+		ip_str((union sock *)sa, addr, sizeof addr);
 		switch(sa->sa_family) {
 		case AF_INET:
 			snprintf(addrport, sizeof addrport, "%s:%hu", this->remote_addr, port);
@@ -552,20 +545,17 @@ _ntrip_log(struct log *log, struct ntrip_state *this, int level, const char *fmt
 			snprintf(addrport, sizeof addrport, "%s.%hu", this->remote_addr, port);
 			break;
 		default:
-			g.addrport = NULL;
+			g.remote_ip = NULL;
 			snprintf(addrport, sizeof addrport, "[???]");
 		}
 	} else {
-		g.addrport = NULL;
+		g.remote_ip = NULL;
 		strcpy(addrport, "-");
 	}
 
 	vasprintf(&g.short_message, fmt, ap);
 
-	if (threads)
-		logfmt_g(log, &g, level, "%s %lld [%lu] %s", addrport, this->id, (long)thread_id, g.short_message);
-	else
-		logfmt_g(log, &g, level, "%s %lld %s", addrport, this->id, g.short_message);
+	logfmt_g(log, &g, level, "%s %lld %s", addrport, this->id, g.short_message);
 
 	free(g.short_message);
 }
@@ -586,34 +576,6 @@ void ntrip_log(void *arg, int level, const char *fmt, ...) {
 	va_start(ap, fmt);
 	_ntrip_log(&this->caster->flog, this, level, fmt, ap);
 	va_end(ap);
-}
-
-int ntrip_handle_raw(struct ntrip_state *st) {
-	struct evbuffer *input = st->input;
-
-	while (1) {
-
-		unsigned long len_raw = evbuffer_get_length(input);
-		ntrip_log(st, LOG_EDEBUG, "ntrip_handle_raw ready to get %d bytes", len_raw);
-		if (len_raw < st->caster->config->min_raw_packet)
-			return 0;
-		if (len_raw > st->caster->config->max_raw_packet)
-			len_raw = st->caster->config->max_raw_packet;
-		struct packet *rawp = packet_new(len_raw, st->caster);
-		st->received_bytes += len_raw;
-		if (rawp == NULL) {
-			evbuffer_drain(input, len_raw);
-			ntrip_log(st, LOG_CRIT, "Raw: Not enough memory, dropping %d bytes", len_raw);
-			return 1;
-		}
-		evbuffer_remove(input, &rawp->data[0], len_raw);
-
-		//ntrip_log(st, LOG_DEBUG, "Raw: packet source %s size %d", st->mountpoint, len_raw);
-		if (livesource_send_subscribers(st->own_livesource, rawp, st->caster))
-			st->last_send = time(NULL);
-		packet_free(rawp);
-		return 1;
-	}
 }
 
 int ntrip_filter_run_input(struct ntrip_state *st) {
@@ -735,75 +697,4 @@ int ntrip_chunk_decode_init(struct ntrip_state *st) {
 		ntrip_chunk_decode(st->filter.raw_input, st->input, -1, BEV_NORMAL, st);
 	}
 	return 0;
-}
-
-/*
- * Handle receipt and retransmission of 1 RTCM packet.
- * Return 0 if more data is needed.
- */
-static int ntrip_handle_rtcm(struct ntrip_state *st) {
-	unsigned short len_rtcm;
-	struct evbuffer_ptr p;
-	struct evbuffer *input = bufferevent_get_input(st->bev);
-	/*
-	 * Look for 0xd3 header byte
-	 */
-	evbuffer_ptr_set(input, &p, 0, EVBUFFER_PTR_SET);
-	p = evbuffer_search(input, "\xd3", 1, &p);
-	if (p.pos < 0) {
-		unsigned long len = evbuffer_get_length(input);
-#if 0
-		char *drain = (char *)strmalloc(len+1);
-		if (drain != NULL) {
-			evbuffer_remove(input, drain, len);
-			drain[len] = '\0';
-			ntrip_log(st, LOG_INFO, "RTCM: draining %zd bytes: \"%s\"", len, drain);
-			free(drain);
-		} else
-#endif
-		{
-			ntrip_log(st, LOG_INFO, "draining %zd bytes", len);
-			evbuffer_drain(input, len);
-		}
-		return 0;
-	}
-	if (p.pos > 0) {
-		ntrip_log(st, LOG_DEBUG, "RTCM: found packet start, draining %zd bytes", p.pos);
-		evbuffer_drain(input, p.pos);
-	}
-
-	unsigned char *mem = evbuffer_pullup(input, 3);
-	if (mem == NULL) {
-		ntrip_log(st, LOG_DEBUG, "RTCM: not enough data, waiting");
-		return 0;
-	}
-
-	/*
-	 * Compute RTCM length from packet header
-	 */
-	len_rtcm = (mem[1] & 3)*256 + mem[2] + 6;
-	if (len_rtcm > evbuffer_get_length(input)) {
-		return 0;
-	}
-
-	struct packet *rtcmp = packet_new(len_rtcm, st->caster);
-	if (rtcmp == NULL) {
-		evbuffer_drain(input, len_rtcm);
-		ntrip_log(st, LOG_CRIT, "RTCM: Not enough memory, dropping packet");
-		return 1;
-	}
-
-	evbuffer_remove(input, &rtcmp->data[0], len_rtcm);
-	unsigned long crc = crc24q_hash(&rtcmp->data[0], len_rtcm-3);
-	if (crc == (rtcmp->data[len_rtcm-3]<<16)+(rtcmp->data[len_rtcm-2]<<8)+rtcmp->data[len_rtcm-1]) {
-		unsigned short type = rtcmp->data[3]*16 + rtcmp->data[4]/16;
-		ntrip_log(st, LOG_DEBUG, "RTCM source %s size %d type %d", st->mountpoint, len_rtcm, type);
-	} else {
-		ntrip_log(st, LOG_INFO, "RTCM: bad checksum! %08lx %08x", crc, (rtcmp->data[len_rtcm-3]<<16)+(rtcmp->data[len_rtcm-2]<<8)+rtcmp->data[len_rtcm-1]);
-	}
-
-	if (livesource_send_subscribers(st->own_livesource, rtcmp, st->caster))
-		st->last_send = time(NULL);
-	packet_free(rtcmp);
-	return 1;
 }
