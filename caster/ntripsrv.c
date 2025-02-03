@@ -14,6 +14,7 @@
 #include "ntrip_common.h"
 #include "packet.h"
 #include "redistribute.h"
+#include "rtcm.h"
 #include "util.h"
 
 const char *server_headers = "Server: NTRIP " SERVER_VERSION_STRING "\r\n";
@@ -380,7 +381,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					char *mountpoint = st->http_args[1]+1;
 					struct sourceline *sourceline = NULL;
 					if (*mountpoint)
-						sourceline = stack_find_mountpoint(&st->caster->sourcetablestack, mountpoint);
+						sourceline = stack_find_mountpoint(st->caster, &st->caster->sourcetablestack, mountpoint);
 
 					/*
 					 * Source not found: reply with the sourcetable in NTRIP1, 404 in NTRIP2.
@@ -468,7 +469,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						mountpoint = st->http_args[2];
 						st->client_version = 1;
 					}
-					struct sourceline *sourceline = stack_find_mountpoint(&st->caster->sourcetablestack, mountpoint);
+					struct sourceline *sourceline = stack_find_local_mountpoint(st->caster, &st->caster->sourcetablestack, mountpoint);
 					if (st->client_version == 2 && (!st->user || !st->password)) {
 						err = 401;
 						break;
@@ -508,6 +509,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						ntripsrv_send_stream_result_ok(st, output, NULL, NULL);
 					struct timeval read_timeout = { st->caster->config->source_read_timeout, 0 };
 					st->state = NTRIP_WAIT_STREAM_SOURCE;
+					ntrip_set_rtcm_cache(st);
 					bufferevent_set_timeouts(bev, &read_timeout, NULL);
 				}
 			}
@@ -538,8 +540,8 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 			}
 		} else if (st->state == NTRIP_WAIT_STREAM_SOURCE) {
 			// will increment st->received_bytes itself
-			if (!packet_handle_raw(st))
-				break;
+			rtcm_packet_handle(st);
+			break;
 		}
 
 		if (line) {
