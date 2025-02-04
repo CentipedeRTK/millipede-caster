@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/queue.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <event2/buffer.h>
@@ -179,6 +180,8 @@ caster_new(struct config *config, const char *config_file) {
 	if (this == NULL)
 		return this;
 
+	gettimeofday(&this->start_date, NULL);
+
 	struct event_base *base;
 	struct evdns_base *dns_base;
 
@@ -211,6 +214,8 @@ caster_new(struct config *config, const char *config_file) {
 	}
 
 	P_RWLOCK_INIT(&this->livesources.lock, NULL);
+	this->livesources.serial = 0;
+
 	P_MUTEX_INIT(&this->livesources.delete_lock, NULL);
 	P_RWLOCK_INIT(&this->ntrips.lock, NULL);
 	P_RWLOCK_INIT(&this->ntrips.free_lock, NULL);
@@ -218,6 +223,7 @@ caster_new(struct config *config, const char *config_file) {
 	this->ntrips.next_id = 1;
 
 	this->ntrips.ipcount = hash_table_new(509, NULL);
+	this->livesources.hash = hash_table_new(509, (void(*)(void *))livesource_free);
 
 	// Used for access to source_auth, host_auth, blocklist and listener config
 	P_RWLOCK_INIT(&this->configlock, NULL);
@@ -257,11 +263,15 @@ caster_new(struct config *config, const char *config_file) {
 	fchdir(current_dir);
 	close(current_dir);
 
-	if (err || r1 < 0 || r2 < 0 || !this->config_dir || (threads && this->joblist == NULL) || this->ntrips.ipcount == NULL) {
+	if (err || r1 < 0 || r2 < 0 || !this->config_dir
+	    || (threads && this->joblist == NULL)
+	    || this->ntrips.ipcount == NULL
+	    || this->livesources.hash == NULL) {
 		if (this->joblist) joblist_free(this->joblist);
 		if (r1 < 0) log_free(&this->flog);
 		if (r2 < 0) log_free(&this->alog);
 		if (this->ntrips.ipcount) hash_table_free(this->ntrips.ipcount);
+		if (this->livesources.hash) hash_table_free(this->livesources.hash);
 		strfree(this->config_dir);
 		free(this);
 		return NULL;
@@ -269,7 +279,6 @@ caster_new(struct config *config, const char *config_file) {
 
 	this->base = base;
 	this->dns_base = dns_base;
-	TAILQ_INIT(&this->livesources.queue);
 	TAILQ_INIT(&this->ntrips.queue);
 	TAILQ_INIT(&this->ntrips.free_queue);
 	this->ntrips.n = 0;
@@ -359,6 +368,7 @@ void caster_free(struct caster_state *this) {
 	caster_free_graylog(this);
 	caster_free_listeners(this);
 	hash_table_free(this->ntrips.ipcount);
+	hash_table_free(this->livesources.hash);
 	hash_table_free(this->rtcm_cache);
 
 	caster_free_fetchers(this);
@@ -589,20 +599,6 @@ static int caster_reload_listeners(struct caster_state *this) {
 		return -1;
 	}
 	return 0;
-}
-
-int caster_del_livesource(struct caster_state *this, struct livesource *livesource) {
-	int r = 0;
-	P_MUTEX_LOCK(&this->livesources.delete_lock);
-	P_RWLOCK_WRLOCK(&this->livesources.lock);
-
-	TAILQ_REMOVE(&this->livesources.queue, livesource, next);
-	livesource_free(livesource);
-	r = 1;
-
-	P_RWLOCK_UNLOCK(&this->livesources.lock);
-	P_MUTEX_UNLOCK(&this->livesources.delete_lock);
-	return r;
 }
 
 static int

@@ -13,6 +13,11 @@ enum livesource_state {
 	LIVESOURCE_RUNNING
 };
 
+enum livesource_type {
+	LIVESOURCE_TYPE_DIRECT,
+	LIVESOURCE_TYPE_FETCHED
+};
+
 /*
  * A source subscription for a client.
  */
@@ -34,17 +39,18 @@ TAILQ_HEAD (subscribersq, subscriber);
  */
 struct livesource {
 	P_RWLOCK_T lock;
-	TAILQ_ENTRY(livesource) next;
 	char *mountpoint;
 	struct subscribersq subscribers;
 	int nsubs;
 	int npackets;
 	enum livesource_state state;
+	enum livesource_type type;
 };
-TAILQ_HEAD (livesourceq, livesource);
 
 struct caster_state;
-struct livesource *livesource_new(char *mountpoint, enum livesource_state state);
+struct livesource *livesource_new(char *mountpoint, enum livesource_type type, enum livesource_state state);
+int livesource_del(struct livesource *this, struct caster_state *caster);
+struct livesource *livesource_connected(struct ntrip_state *st, char *mountpoint, struct livesource **existing);
 struct livesource *livesource_find(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos);
 struct livesource *livesource_find_on_demand(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, enum livesource_state *new_state);
 int livesource_kill_subscribers_unlocked(struct livesource *this, int kill_backlogged);
@@ -55,5 +61,8 @@ void livesource_del_subscriber(struct ntrip_state *st);
 int livesource_send_subscribers(struct livesource *this, struct packet *packet, struct caster_state *caster);
 struct livesource *livesource_find_unlocked(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos,int on_demand, enum livesource_state *new_state);
 struct livesource *livesource_find(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos);
+
+struct hash_table;
+struct mime_content *livesource_list_json(struct caster_state *caster, struct hash_table *h);
 
 #endif /* __LIVESOURCE_H__ */

@@ -2,6 +2,7 @@
 #define __CASTER_H__
 
 #include <netinet/in.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <pthread.h>
 
@@ -68,13 +69,16 @@ struct caster_state {
 
 	SSL_CTX *ssl_client_ctx;	// TLS context for fetchers
 
+	struct timeval start_date;
+
 	/*
 	 * Live sources (currently received) related to this caster
 	 */
 	struct {
-		struct livesourceq queue;
+		struct hash_table *hash;
 		P_RWLOCK_T lock;
 		P_MUTEX_T delete_lock;
+		unsigned long long serial;
 	} livesources;
 
 	sourcetable_stack_t sourcetablestack;
@@ -101,7 +105,6 @@ struct caster_state {
 };
 
 void caster_log_error(struct caster_state *this, char *orig);
-int caster_del_livesource(struct caster_state *this, struct livesource *livesource);
 int caster_tls_log_cb(const char *str, size_t len, void *u);
 int caster_main(char *config_file);
 void free_callback(const void *data, size_t datalen, void *extra);

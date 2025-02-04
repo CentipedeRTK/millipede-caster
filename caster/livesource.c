@@ -4,6 +4,8 @@
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 
+#include <json-c/json.h>
+
 #include "conf.h"
 #include "caster.h"
 #include "jobs.h"
@@ -13,9 +15,12 @@
 #include "packet.h"
 #include "queue.h"
 
+static const char *livesource_states[3] = {"INIT", "FETCH_PENDING", "RUNNING"};
+static const char *livesource_types[2] = {"DIRECT", "FETCHED"};
+
 static void _livesource_del_subscriber_unlocked(struct ntrip_state *st);
 
-struct livesource *livesource_new(char *mountpoint, enum livesource_state state) {
+struct livesource *livesource_new(char *mountpoint, enum livesource_type type, enum livesource_state state) {
 	struct livesource *this = (struct livesource *)malloc(sizeof(struct livesource));
 	if (this == NULL)
 		return NULL;
@@ -28,6 +33,7 @@ struct livesource *livesource_new(char *mountpoint, enum livesource_state state)
 	this->nsubs = 0;
 	this->npackets = 0;
 	this->state = state;
+	this->type = type;
 
 	P_RWLOCK_INIT(&this->lock, NULL);
 	return this;
@@ -242,30 +248,76 @@ int livesource_send_subscribers(struct livesource *this, struct packet *packet, 
 	return n;
 }
 
+int livesource_del(struct livesource *this, struct caster_state *caster) {
+	int r = 0;
+	P_MUTEX_LOCK(&caster->livesources.delete_lock);
+	P_RWLOCK_WRLOCK(&caster->livesources.lock);
+	hash_table_del(caster->livesources.hash, this->mountpoint);
+	r = 1;
+	caster->livesources.serial++;
+	P_RWLOCK_UNLOCK(&caster->livesources.lock);
+	P_MUTEX_UNLOCK(&caster->livesources.delete_lock);
+	return r;
+}
+
+/*
+ * Required lock: ntrip_state
+ * Acquires lock: livesources
+ *
+ */
+struct livesource *livesource_connected(struct ntrip_state *st, char *mountpoint, struct livesource **existing) {
+	struct livesource *existing_livesource;
+
+	assert(st->own_livesource == NULL && st->subscription == NULL);
+
+	/*
+	 * A deadlock by lock order reversal (livesources then ntrip_state) is not possible here
+	 * since we are not a source subscriber.
+	 */
+	P_RWLOCK_WRLOCK(&st->caster->livesources.lock);
+	existing_livesource = livesource_find_unlocked(st->caster, st, mountpoint, NULL, 0, NULL);
+	if (existing)
+		*existing = existing_livesource;
+	if (existing_livesource) {
+		/* Here, we should perphaps destroy & replace any existing source fetcher. */
+		P_RWLOCK_UNLOCK(&st->caster->livesources.lock);
+		return NULL;
+	}
+	struct livesource *np = livesource_new(mountpoint, LIVESOURCE_TYPE_DIRECT, LIVESOURCE_RUNNING);
+	if (np == NULL) {
+		P_RWLOCK_UNLOCK(&st->caster->livesources.lock);
+		st->own_livesource = NULL;
+		return NULL;
+	}
+	hash_table_add(st->caster->livesources.hash, mountpoint, np);
+	st->caster->livesources.serial++;
+	st->own_livesource = np;
+	P_RWLOCK_UNLOCK(&st->caster->livesources.lock);
+	ntrip_log(st, LOG_INFO, "livesource %s created RUNNING", mountpoint);
+	return np;
+}
 /*
  * Find a livesource by mountpoint name.
- * Warning: O(n) complexity.
  *
  * Required lock (read): livesource list.
  */
 struct livesource *livesource_find_unlocked(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, enum livesource_state *new_state) {
 	struct livesource *np;
 	struct livesource *result = NULL;
-	TAILQ_FOREACH(np, &this->livesources.queue, next) {
-		if (!strcmp(np->mountpoint, mountpoint)
-			&& (np->state == LIVESOURCE_RUNNING
-			    || (on_demand && np->state == LIVESOURCE_FETCH_PENDING))) {
-			result = np;
-			break;
-		}
-	}
+
+	np = (struct livesource *)hash_table_get(this->livesources.hash, mountpoint);
+
+	if (np && (np->state == LIVESOURCE_RUNNING
+			    || (on_demand && np->state == LIVESOURCE_FETCH_PENDING)))
+		result = np;
 
 	if (result == NULL && on_demand && st) {
-		struct livesource *np = livesource_new(mountpoint, LIVESOURCE_FETCH_PENDING);
+		struct livesource *np = livesource_new(mountpoint, LIVESOURCE_TYPE_FETCHED, LIVESOURCE_FETCH_PENDING);
 		if (np == NULL) {
 			return NULL;
 		}
-		TAILQ_INSERT_TAIL(&this->livesources.queue, np, next);
+		hash_table_add(this->livesources.hash, mountpoint, np);
+		this->livesources.serial++;
 		ntrip_log(st, LOG_INFO, "Trying to subscribe to on-demand source %s", mountpoint);
 		struct redistribute_cb_args *redis_args = redistribute_args_new(this, np, mountpoint, mountpoint_pos, this->config->reconnect_delay, 0);
 		joblist_append_redistribute(this->joblist, redistribute_source_stream, redis_args);
@@ -280,7 +332,6 @@ struct livesource *livesource_find_unlocked(struct caster_state *this, struct nt
 
 /*
  * Find a livesource by mountpoint name.
- * Warning: O(n) complexity.
  */
 struct livesource *livesource_find_on_demand(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, enum livesource_state *new_state) {
 	P_RWLOCK_RDLOCK(&this->livesources.lock);
@@ -291,4 +342,50 @@ struct livesource *livesource_find_on_demand(struct caster_state *this, struct n
 
 struct livesource *livesource_find(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos) {
 	return livesource_find_on_demand(this, st, mountpoint, mountpoint_pos, 0, NULL);
+}
+
+/*
+ * Return a livesource structure as JSON.
+ */
+static json_object *livesource_json(struct livesource *this) {
+	json_object *j = json_object_new_object();
+	json_object_object_add(j, "mountpoint", json_object_new_string(this->mountpoint));
+	json_object_object_add(j, "nsubscribers", json_object_new_int(this->nsubs));
+	json_object_object_add(j, "npackets", json_object_new_int(this->npackets));
+	json_object_object_add(j, "state", json_object_new_string(livesource_states[this->state]));
+	json_object_object_add(j, "type", json_object_new_string(livesource_types[this->type]));
+	return j;
+}
+
+/*
+ * Return the full list of livesources as JSON.
+ */
+struct mime_content *livesource_list_json(struct caster_state *caster, struct hash_table *h) {
+	char *s;
+	json_object *jmain;
+	json_object *new_list;
+
+	jmain = json_object_new_object();
+	json_object_object_add(jmain, "hostname", json_object_new_string(caster->hostname));
+	json_object_object_add(jmain, "serial", json_object_new_int64(caster->livesources.serial));
+
+	char iso_date[30];
+	iso_date_from_timeval(iso_date, sizeof iso_date, &caster->start_date);
+	json_object_object_add(jmain, "start_date", json_object_new_string(iso_date));
+
+	new_list = json_object_new_object();
+	struct hash_iterator hi;
+	struct element *e;
+	P_RWLOCK_RDLOCK(&caster->livesources.lock);
+	HASH_FOREACH(e, caster->livesources.hash, hi) {
+		json_object *j = livesource_json((struct livesource *)e->value);
+		json_object_object_add(new_list, e->key, j);
+	}
+	P_RWLOCK_UNLOCK(&caster->livesources.lock);
+	json_object_object_add(jmain, "livesources", new_list);
+
+	s = mystrdup(json_object_to_json_string(jmain));
+	struct mime_content *m = mime_new(s, -1, "application/json", 1);
+	json_object_put(jmain);
+	return m;
 }
