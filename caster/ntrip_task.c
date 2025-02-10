@@ -13,7 +13,7 @@ _ntrip_task_restart_cb(int fd, short what, void *arg) {
 	struct ntrip_task *a = (struct ntrip_task *)arg;
 	event_free(a->ev);
 	a->ev = NULL;
-	a->restart_cb(a->restart_cb_arg);
+	a->restart_cb(a->restart_cb_arg, a->cb_arg2);
 }
 
 /*
@@ -111,21 +111,25 @@ static size_t ntrip_task_drain_queue(struct ntrip_task *this) {
 	if (this->st != NULL)
 		bufferevent_unlock(this->st->bev);
 
-	if (!this->drainfilename || !r)
+	if (!r)
 		return r;
 
-	char filename[PATH_MAX];
-	filedate(filename, sizeof filename, this->drainfilename);
-	FILE *f = fopen(filename, "a+");
-	if (f == NULL)
-		return -1;
+	FILE *f = NULL;
+	if (this->drainfilename) {
+		char filename[PATH_MAX];
+		filedate(filename, sizeof filename, this->drainfilename);
+		f = fopen(filename, "a+");
+	}
 	while ((m = STAILQ_FIRST(&tmp_mimeq))) {
 		STAILQ_REMOVE_HEAD(&tmp_mimeq, next);
-		fputs(m->s, f);
-		fputs("\n", f);
+		if (f != NULL) {
+			fputs(m->s, f);
+			fputs("\n", f);
+		}
 		mime_free(m);
 	}
-	fclose(f);
+	if (f != NULL)
+		fclose(f);
 	return r;
 }
 
@@ -244,6 +248,7 @@ void ntrip_task_ack_pending(struct ntrip_task *this) {
 		this->st->sent_bytes += m->len;
 		this->queue_size -= m->len;
 		this->pending--;
+		mime_free(m);
 	}
 	assert(this->pending == 0);
 }
@@ -253,6 +258,7 @@ void ntrip_task_free(struct ntrip_task *this) {
 	ntrip_task_drain_queue(this);
 	strfree(this->host);
 	strfree((char *)this->uri);
+	strfree((char *)this->drainfilename);
 	free(this);
 }
 

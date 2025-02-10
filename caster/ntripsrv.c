@@ -14,24 +14,47 @@
 #include "ntrip_common.h"
 #include "packet.h"
 #include "redistribute.h"
+#include "request.h"
 #include "rtcm.h"
 #include "util.h"
 
 const char *server_headers = "Server: NTRIP " SERVER_VERSION_STRING "\r\n";
 
+struct httpcode {
+	unsigned short status;
+	const char *message;
+};
+
+static struct httpcode httpcodes[] = {
+	{200, "OK"},
+	{400, "Bad Request"},
+	{401, "Unauthorized"},
+	{404, "Not Found"},
+	{409, "Conflict"},
+	{500, "Internal Server Error"},
+	{501, "Not Implemented"},
+	{503, "Service Unavailable"},
+	{0, "Unknown Error"}
+};
+
 static void
 send_server_reply(struct ntrip_state *this, struct evbuffer *ev,
-	int status_code, char *status, struct evkeyvalq *headers, char *firstword,
+	int status_code, struct evkeyvalq *headers, char *firstword,
 	struct mime_content *m) {
 	char date[32];
 	time_t tstamp = time(NULL);
 	int sent = 0, len;
+	const char *msg;
+
+	struct httpcode *htc = httpcodes;
+	for (htc = httpcodes; htc->status && htc->status != status_code; htc++);
+	msg = htc->message;
 
 	firstword = (this->client_version == 1 && firstword && this->user_agent_ntrip)?firstword:"HTTP/1.1";
 	struct tm *t = gmtime(&tstamp);
 	strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", t);
 
-	len = evbuffer_add_printf(ev, "%s %d %s\r\n%sDate: %s\r\n", firstword, status_code, status, server_headers, date);
+	len = evbuffer_add_printf(ev, "%s %d %s\r\n%sDate: %s\r\n", firstword, status_code, msg, server_headers, date);
 	if (len > 0) sent += len;
 
 	if (this->server_version == 2) {
@@ -44,7 +67,8 @@ send_server_reply(struct ntrip_state *this, struct evbuffer *ev,
 	} else if (m) {
 		len = evbuffer_add_printf(ev, "Content-Length: %lu\r\n", m->len);
 		if (len > 0) sent += len;
-	} if (this->connection_keepalive) {
+	}
+	if (this->connection_keepalive) {
 		evbuffer_add_reference(ev, "Connection: keep-alive\r\n", 24, NULL, NULL);
 		len += 24;
 	} else {
@@ -78,9 +102,9 @@ static int ntripsrv_send_sourcetable(struct ntrip_state *this, struct evbuffer *
 	if (m == NULL)
 		return 503;
 
-	if (this->client_version == 1)
+	if (this->client_version != 2)
 		mime_set_type(m, "text/plain");
-	send_server_reply(this, output, 200, "OK", NULL, "SOURCETABLE", m);
+	send_server_reply(this, output, 200, NULL, "SOURCETABLE", m);
 	return 0;
 }
 
@@ -102,7 +126,7 @@ static int _ntripsrv_send_result_ok(struct ntrip_state *this, struct evbuffer *o
 				evhttp_add_header(&headers, np->key, np->value);
 			}
 		}
-		send_server_reply(this, output, 200, "OK", &headers, NULL, m);
+		send_server_reply(this, output, 200, &headers, NULL, m);
 		evhttp_clear_headers(&headers);
 	}
 	return 0;
@@ -123,18 +147,20 @@ int ntripsrv_send_stream_result_ok(struct ntrip_state *this, struct evbuffer *ou
  */
 void ntripsrv_deferred_output(
 	struct ntrip_state *st,
-	struct mime_content *(*content_cb)(struct caster_state *caster, struct hash_table *hash),
-	struct hash_table *hash) {
+	struct mime_content *(*content_cb)(struct caster_state *caster, struct request *req),
+	struct request *req) {
 
-	struct mime_content *r = content_cb(st->caster, hash);
+	struct mime_content *m = content_cb(st->caster, req);
 	bufferevent_lock(st->bev);
 	struct evbuffer *output = bufferevent_get_output(st->bev);
-	ntripsrv_send_result_ok(st, output, r, NULL);
+
+	send_server_reply(st, output, req->status, NULL, NULL, m);
+
 	ntrip_log(st, LOG_DEBUG, "ntripsrv_deferred_output WAIT_CLOSE");
 	st->state = NTRIP_WAIT_CLOSE;
 	bufferevent_unlock(st->bev);
-	if (hash)
-		hash_table_free(hash);
+	if (req)
+		request_free(req);
 }
 
 /*
@@ -403,8 +429,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 
 					st->type = "client";
 					if (!st->source_virtual) {
-						P_MUTEX_LOCK(&st->caster->livesources.delete_lock);
-						struct livesource *l = livesource_find_on_demand(st->caster, st, mountpoint, &sourceline->pos, st->source_on_demand, NULL);
+						struct livesource *l = livesource_find_and_subscribe(st->caster, st, mountpoint, &sourceline->pos, st->source_on_demand);
 						if (l) {
 							ntrip_log(st, LOG_DEBUG, "Found requested source %s, on_demand=%d", mountpoint, st->source_on_demand);
 							ntripsrv_send_stream_result_ok(st, output, "gnss/data", NULL);
@@ -412,9 +437,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 
 							/* Regular NTRIP stream client: disable read and write timeouts */
 							bufferevent_set_timeouts(bev, NULL, NULL);
-							livesource_add_subscriber(l, st);
 						} else {
-							P_MUTEX_UNLOCK(&st->caster->livesources.delete_lock);
 							if (st->client_version == 1) {
 								err = ntripsrv_send_sourcetable(st, output);
 								st->state = NTRIP_WAIT_CLOSE;
@@ -422,7 +445,6 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 								err = 404;
 							break;
 						}
-						P_MUTEX_UNLOCK(&st->caster->livesources.delete_lock);
 					} else {
 						ntripsrv_send_stream_result_ok(st, output, "gnss/data", NULL);
 						st->state = NTRIP_WAIT_CLIENT_INPUT;
@@ -554,32 +576,32 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 
 	if (err) {
 		if (err == 400)
-			send_server_reply(st, output, 400, "Bad Request", NULL, NULL, NULL);
+			send_server_reply(st, output, 400, NULL, NULL, NULL);
 		else if (err == 401) {
 			if (st->client_version == 1 && method_post_source)
 				evbuffer_add_reference(output, "ERROR - Bad Password\r\n", 22, NULL, NULL);
 			else {
-				send_server_reply(st, output, 401, "Unauthorized", &opt_headers, NULL, NULL);
+				send_server_reply(st, output, 401, &opt_headers, NULL, NULL);
 				evbuffer_add_reference(output, "401\r\n", 5, NULL, NULL);
 			}
 		} else if (err == 404) {
 			if (st->client_version == 1 && method_post_source)
 				evbuffer_add_reference(output, "ERROR - Mount Point Taken or Invalid\r\n", 38, NULL, NULL);
 			else
-				send_server_reply(st, output, 404, "Not Found", NULL, NULL, NULL);
+				send_server_reply(st, output, 404, NULL, NULL, NULL);
 		} else if (err == 409) {
 			if (st->client_version == 1 && method_post_source)
 				evbuffer_add_reference(output, "ERROR - Mount Point Taken or Invalid\r\n", 38, NULL, NULL);
 			else
-				send_server_reply(st, output, 409, "Conflict", NULL, NULL, NULL);
+				send_server_reply(st, output, 409, NULL, NULL, NULL);
 		} else if (err == 500)
-			send_server_reply(st, output, 500, "Internal Server Error", NULL, NULL, NULL);
+			send_server_reply(st, output, 500, NULL, NULL, NULL);
 		else if (err == 501)
-			send_server_reply(st, output, 501, "Not Implemented", NULL, NULL, NULL);
+			send_server_reply(st, output, 501, NULL, NULL, NULL);
 		else if (err == 503)
-			send_server_reply(st, output, 503, "Service Unavailable", NULL, NULL, NULL);
+			send_server_reply(st, output, 503, NULL, NULL, NULL);
 		else
-			send_server_reply(st, output, err, "Unknown Error", NULL, NULL, NULL);
+			send_server_reply(st, output, err, NULL, NULL, NULL);
 		ntrip_log(st, LOG_EDEBUG, "ntripsrv_readcb err %d", err);
 		st->state = NTRIP_WAIT_CLOSE;
 	}

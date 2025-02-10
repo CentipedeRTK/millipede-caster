@@ -154,6 +154,10 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 		if (st->state == NTRIP_WAIT_HTTP_STATUS) {
 			char *token, *status, **arg;
 
+			/* Free args from a previous request in keep-alive mode */
+			for (arg = &st->http_args[0]; arg < &st->http_args[SIZE_HTTP_ARGS] && *arg; arg++)
+				strfree(*arg);
+
 			st->chunk_state = CHUNK_NONE;
 			if (st->chunk_buf) {
 				evbuffer_free(st->chunk_buf);
@@ -203,7 +207,7 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 			}
 
 			if (st->task && st->task->status_cb)
-				st->task->status_cb(st->task->status_cb_arg, status_code);
+				st->task->status_cb(st->task->status_cb_arg, status_code, st->task->cb_arg2);
 
 			st->received_keepalive = 0;
 			st->content_length = 0;
@@ -280,7 +284,7 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 			/* Add 1 for the trailing LF or CR LF. We don't care for the exact count. */
 			st->received_bytes += len + 1;
 
-			if (st->task && st->task->line_cb(st, st->task->line_cb_arg, line)) {
+			if (st->task && st->task->line_cb(st, st->task->line_cb_arg, line, st->task->cb_arg2)) {
 				st->task = NULL;
 				end = 1;
 			}
@@ -310,7 +314,7 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 			}
 		} else if (st->state == NTRIP_REGISTER_SOURCE) {
 			if (st->own_livesource) {
-				livesource_set_state(st->own_livesource, LIVESOURCE_RUNNING);
+				livesource_set_state(st->own_livesource, st->caster, LIVESOURCE_RUNNING);
 				ntrip_log(st, LOG_INFO, "starting redistribute for %s", st->mountpoint);
 			}
 			st->state = NTRIP_WAIT_STREAM_GET;

@@ -213,17 +213,14 @@ caster_new(struct config *config, const char *config_file) {
 		return NULL;
 	}
 
-	P_RWLOCK_INIT(&this->livesources.lock, NULL);
-	this->livesources.serial = 0;
+	this->livesources = livesource_table_new();
 
-	P_MUTEX_INIT(&this->livesources.delete_lock, NULL);
 	P_RWLOCK_INIT(&this->ntrips.lock, NULL);
 	P_RWLOCK_INIT(&this->ntrips.free_lock, NULL);
 	P_RWLOCK_INIT(&this->rtcm_lock, NULL);
 	this->ntrips.next_id = 1;
 
 	this->ntrips.ipcount = hash_table_new(509, NULL);
-	this->livesources.hash = hash_table_new(509, (void(*)(void *))livesource_free);
 
 	// Used for access to source_auth, host_auth, blocklist and listener config
 	P_RWLOCK_INIT(&this->configlock, NULL);
@@ -266,12 +263,12 @@ caster_new(struct config *config, const char *config_file) {
 	if (err || r1 < 0 || r2 < 0 || !this->config_dir
 	    || (threads && this->joblist == NULL)
 	    || this->ntrips.ipcount == NULL
-	    || this->livesources.hash == NULL) {
+	    || this->livesources == NULL) {
 		if (this->joblist) joblist_free(this->joblist);
 		if (r1 < 0) log_free(&this->flog);
 		if (r2 < 0) log_free(&this->alog);
 		if (this->ntrips.ipcount) hash_table_free(this->ntrips.ipcount);
-		if (this->livesources.hash) hash_table_free(this->livesources.hash);
+		if (this->livesources) livesource_table_free(this->livesources);
 		strfree(this->config_dir);
 		free(this);
 		return NULL;
@@ -322,7 +319,7 @@ static int caster_start_graylog(struct caster_state *this) {
 			this->config->graylog[i].queue_max_size,
 			this->config->graylog[i].authorization,
 			this->config->graylog[i].drainfilename);
-		graylog_sender_start(this->graylog[i]);
+		graylog_sender_start(this->graylog[i], 0);
 	}
 	return 0;
 }
@@ -368,7 +365,7 @@ void caster_free(struct caster_state *this) {
 	caster_free_graylog(this);
 	caster_free_listeners(this);
 	hash_table_free(this->ntrips.ipcount);
-	hash_table_free(this->livesources.hash);
+	livesource_table_free(this->livesources);
 	hash_table_free(this->rtcm_cache);
 
 	caster_free_fetchers(this);
@@ -391,8 +388,6 @@ void caster_free(struct caster_state *this) {
 
 	if (this->joblist) joblist_free(this->joblist);
 	P_RWLOCK_DESTROY(&this->sourcetablestack.lock);
-	P_RWLOCK_DESTROY(&this->livesources.lock);
-	P_MUTEX_DESTROY(&this->livesources.delete_lock);
 	P_RWLOCK_DESTROY(&this->rtcm_lock);
 	P_RWLOCK_DESTROY(&this->ntrips.lock);
 	P_RWLOCK_DESTROY(&this->ntrips.free_lock);
@@ -885,7 +880,7 @@ static int caster_start_fetchers(struct caster_state *this) {
 			this->config->proxy[i].table_refresh_delay,
 			this->config->proxy[i].priority);
 		if (fetchers[i])
-			fetcher_sourcetable_start(fetchers[i]);
+			fetcher_sourcetable_start(fetchers[i], 0);
 	}
 
 	return 0;
