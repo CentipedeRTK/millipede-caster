@@ -177,6 +177,7 @@ struct ntrip_state {
 	/*
 	 * NTRIP server state
 	 */
+	int scheme_basic;			// Flag: "Basic" or "internal" auth scheme
 	char *user, *password;
 	char *mountpoint;
 	pos_t mountpoint_pos;			// geographical position of the current source
@@ -222,6 +223,7 @@ int ntrip_register_check(struct ntrip_state *this);
 void ntrip_set_fd(struct ntrip_state *this);
 void ntrip_set_peeraddr(struct ntrip_state *this, struct sockaddr *sa, size_t socklen);
 void ntrip_set_localaddr(struct ntrip_state *this);
+void ntrip_clear_request(struct ntrip_state *this);
 void ntrip_free(struct ntrip_state *this, char *orig);
 void ntrip_deferred_free(struct ntrip_state *this, char *orig);
 void ntrip_deferred_run(struct caster_state *this);

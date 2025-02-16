@@ -44,6 +44,16 @@ struct config_proxy {
 	int tls;
 };
 
+struct config_node {
+	/*
+	 * Destination host and port
+	 */
+	char *host;
+	unsigned short port;
+	char *authorization;
+	int tls;
+};
+
 struct config_graylog {
 	/*
 	 * Configuration for a graylog server
@@ -89,6 +99,12 @@ struct config {
 	 */
 	struct config_proxy	*proxy;
 	int			proxy_count;
+
+	/*
+	 * Node list definition
+	 */
+	struct config_node	*node;
+	int			node_count;
 
 	/*
 	 * Graylog server definition
@@ -192,6 +208,9 @@ struct config {
 
 	/* Used only for YAML config reading as the CYAML default is 0 */
 	int disable_zero_copy;
+
+	/* Auth key for incoming syncer API connections */
+	char *syncer_auth;
 };
 
 extern int backlog_delay;

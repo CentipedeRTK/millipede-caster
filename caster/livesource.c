@@ -5,6 +5,7 @@
 #include <event2/bufferevent.h>
 
 #include <json-c/json.h>
+#include <json-c/json_object_iterator.h>
 
 #include "conf.h"
 #include "caster.h"
@@ -14,25 +15,102 @@
 #include "ntripsrv.h"
 #include "packet.h"
 #include "queue.h"
+#include "util.h"
 
-static const char *livesource_states[3] = {"INIT", "FETCH_PENDING", "RUNNING"};
-static const char *livesource_types[2] = {"DIRECT", "FETCHED"};
+static const char *livesource_states[4] = {"INIT", "FETCH_PENDING", "RUNNING", NULL};
+static const char *livesource_types[3] = {"DIRECT", "FETCHED", NULL};
+static const char *livesource_update_types[4] = {"none", "add", "del", "update"};
 
 static void _livesource_del_subscriber_unlocked(struct ntrip_state *st);
+static json_object *livesource_update_json(struct livesource *this,
+	struct caster_state *caster, enum livesource_update_type utype);
+static struct livesource *livesource_find_unlocked(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, enum livesource_state *new_state, json_object **jp);
+static void livesource_send_json(struct caster_state *caster, json_object *j);
 
-struct livesources *livesource_table_new() {
-	struct livesources *this = (struct livesources *)malloc(sizeof(struct livesources));
-	P_RWLOCK_INIT(&this->lock, NULL);
-	P_MUTEX_INIT(&this->delete_lock, NULL);
-	this->serial = 0;
-	this->hash = hash_table_new(509, (void(*)(void *))livesource_free);
+/*
+ * Create a remote livesource record
+ */
+static struct livesource_remote *livesource_remote_new(const char *mountpoint) {
+	struct livesource_remote *this = (struct livesource_remote *)malloc(sizeof(struct livesource_remote));
+	if (this != NULL) {
+		this->mountpoint = mystrdup(mountpoint);
+		if (this->mountpoint == NULL) {
+			free(this);
+			return NULL;
+		}
+	}
+	return this;
+}
+
+static void livesource_remote_free(struct livesource_remote *this) {
+	strfree(this->mountpoint);
+	strfree(this);
+}
+
+static void livesources_remote_free(struct livesources_remote *this) {
+	if (this->hash != NULL)
+		hash_table_free(this->hash);
+	strfree(this->start_date);
+	strfree(this->hostname);
+	free(this);
+}
+
+/*
+ * Create a table of livesources for a remote node
+ */
+static struct livesources_remote *livesources_remote_new(const char *hostname, const char *start_date, unsigned long long serial) {
+	struct livesources_remote *this = (struct livesources_remote *)malloc(sizeof(struct livesources_remote));
+
+	if (this == NULL)
+		return NULL;
+
+	char *dup_start_date = mystrdup(start_date);
+	char *dup_hostname = mystrdup(hostname);
+
+	this->serial = serial;
+	this->hash = hash_table_new(509, (void(*)(void *))livesource_remote_free);
+	if (dup_start_date == NULL || dup_hostname == NULL || this->hash == NULL) {
+		livesources_remote_free(this);
+		return NULL;
+	}
+	this->start_date = dup_start_date;
+	this->hostname = dup_hostname;
 	return this;
 }
 
 void livesource_table_free(struct livesources *this) {
+	if (this->hash != NULL)
+		hash_table_free(this->hash);
+	if (this->remote != NULL)
+		hash_table_free(this->remote);
 	P_RWLOCK_DESTROY(&this->lock);
 	P_MUTEX_DESTROY(&this->delete_lock);
-	hash_table_free(this->hash);
+	strfree(this->start_date);
+	strfree(this->hostname);
+	free(this);
+}
+
+struct livesources *livesource_table_new(const char *hostname, struct timeval *start_date) {
+	struct livesources *this = (struct livesources *)malloc(sizeof(struct livesources));
+
+	if (this == NULL)
+		return NULL;
+
+	P_RWLOCK_INIT(&this->lock, NULL);
+	P_MUTEX_INIT(&this->delete_lock, NULL);
+	this->serial = 0;
+	this->hash = hash_table_new(509, (void(*)(void *))livesource_free);
+	this->remote = hash_table_new(113, (void(*)(void *))livesources_remote_free);
+
+	char iso_date[40];
+	iso_date_from_timeval(iso_date, sizeof iso_date, start_date);
+	this->start_date = mystrdup(iso_date);
+	this->hostname = mystrdup(hostname);
+
+	if (this->start_date == NULL || this->hostname == NULL
+		|| this->hash == NULL || this->remote == NULL)
+		livesource_table_free(this);
+	return this;
 }
 
 struct livesource *livesource_new(char *mountpoint, enum livesource_type type, enum livesource_state state) {
@@ -104,12 +182,15 @@ void livesource_free(struct livesource *this) {
 }
 
 void livesource_set_state(struct livesource *this, struct caster_state *caster, enum livesource_state state) {
+	json_object *j = NULL;
 	P_RWLOCK_WRLOCK(&this->lock);
 	if (this->state != state) {
 		this->state = state;
+		j = livesource_update_json(this, caster, LIVESOURCE_UPDATE_STATUS);
 		caster->livesources->serial++;
 	}
 	P_RWLOCK_UNLOCK(&this->lock);
+	livesource_send_json(caster, j);
 }
 
 /*
@@ -267,14 +348,17 @@ int livesource_send_subscribers(struct livesource *this, struct packet *packet, 
 }
 
 int livesource_del(struct livesource *this, struct caster_state *caster) {
+	json_object *j;
 	int r = 0;
 	P_MUTEX_LOCK(&caster->livesources->delete_lock);
 	P_RWLOCK_WRLOCK(&caster->livesources->lock);
+	j = livesource_update_json(this, caster, LIVESOURCE_UPDATE_DEL);
 	hash_table_del(caster->livesources->hash, this->mountpoint);
 	r = 1;
 	caster->livesources->serial++;
 	P_RWLOCK_UNLOCK(&caster->livesources->lock);
 	P_MUTEX_UNLOCK(&caster->livesources->delete_lock);
+	livesource_send_json(caster, j);
 	return r;
 }
 
@@ -284,6 +368,7 @@ int livesource_del(struct livesource *this, struct caster_state *caster) {
  *
  */
 struct livesource *livesource_connected(struct ntrip_state *st, char *mountpoint, struct livesource **existing) {
+	json_object *j;
 	struct livesource *existing_livesource;
 
 	assert(st->own_livesource == NULL && st->subscription == NULL);
@@ -293,7 +378,7 @@ struct livesource *livesource_connected(struct ntrip_state *st, char *mountpoint
 	 * since we are not a source subscriber.
 	 */
 	P_RWLOCK_WRLOCK(&st->caster->livesources->lock);
-	existing_livesource = livesource_find_unlocked(st->caster, st, mountpoint, NULL, 0, NULL);
+	existing_livesource = livesource_find_unlocked(st->caster, st, mountpoint, NULL, 0, NULL, &j);
 	if (existing)
 		*existing = existing_livesource;
 	if (existing_livesource) {
@@ -303,25 +388,30 @@ struct livesource *livesource_connected(struct ntrip_state *st, char *mountpoint
 	}
 	struct livesource *np = livesource_new(mountpoint, LIVESOURCE_TYPE_DIRECT, LIVESOURCE_RUNNING);
 	if (np == NULL) {
-		P_RWLOCK_UNLOCK(&st->caster->livesources->lock);
 		st->own_livesource = NULL;
+		P_RWLOCK_UNLOCK(&st->caster->livesources->lock);
 		return NULL;
 	}
 	hash_table_add(st->caster->livesources->hash, mountpoint, np);
+	j = livesource_update_json(np, st->caster, LIVESOURCE_UPDATE_ADD);
 	st->caster->livesources->serial++;
 	st->own_livesource = np;
 	P_RWLOCK_UNLOCK(&st->caster->livesources->lock);
 	ntrip_log(st, LOG_INFO, "livesource %s created RUNNING", mountpoint);
+	livesource_send_json(st->caster, j);
 	return np;
 }
+
 /*
  * Find a livesource by mountpoint name.
  *
  * Required lock (read): livesource list.
  */
-struct livesource *livesource_find_unlocked(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, enum livesource_state *new_state) {
+static struct livesource *livesource_find_unlocked(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, enum livesource_state *new_state, json_object **jp) {
 	struct livesource *np;
 	struct livesource *result = NULL;
+
+	*jp = NULL;
 
 	np = (struct livesource *)hash_table_get(this->livesources->hash, mountpoint);
 
@@ -335,6 +425,7 @@ struct livesource *livesource_find_unlocked(struct caster_state *this, struct nt
 			return NULL;
 		}
 		hash_table_add(this->livesources->hash, mountpoint, np);
+		*jp = livesource_update_json(np, this, LIVESOURCE_UPDATE_ADD);
 		this->livesources->serial++;
 		ntrip_log(st, LOG_INFO, "Trying to subscribe to on-demand source %s", mountpoint);
 		struct redistribute_cb_args *redis_args = redistribute_args_new(this, np, mountpoint, mountpoint_pos, this->config->reconnect_delay, 0);
@@ -352,9 +443,11 @@ struct livesource *livesource_find_unlocked(struct caster_state *this, struct nt
  * Find a livesource by mountpoint name.
  */
 struct livesource *livesource_find_on_demand(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, enum livesource_state *new_state) {
+	json_object *j;
 	P_RWLOCK_RDLOCK(&this->livesources->lock);
-	struct livesource *result = livesource_find_unlocked(this, st, mountpoint, mountpoint_pos, on_demand, new_state);
+	struct livesource *result = livesource_find_unlocked(this, st, mountpoint, mountpoint_pos, on_demand, new_state, &j);
 	P_RWLOCK_UNLOCK(&this->livesources->lock);
+	livesource_send_json(this, j);
 	return result;
 }
 
@@ -372,47 +465,335 @@ struct livesource *livesource_find_and_subscribe(struct caster_state *caster, st
 }
 
 /*
- * Return a livesource structure as JSON.
+ * Common code for livesource remote/local
  */
-static json_object *livesource_json(struct livesource *this) {
+static json_object *_livesource_common_json(const char *mountpoint, enum livesource_state state, enum livesource_type type, int add_state_type) {
 	json_object *j = json_object_new_object();
-	json_object_object_add(j, "mountpoint", json_object_new_string(this->mountpoint));
-	json_object_object_add(j, "nsubscribers", json_object_new_int(this->nsubs));
-	json_object_object_add(j, "npackets", json_object_new_int(this->npackets));
-	json_object_object_add(j, "state", json_object_new_string(livesource_states[this->state]));
-	json_object_object_add(j, "type", json_object_new_string(livesource_types[this->type]));
+	json_object_object_add(j, "mountpoint", json_object_new_string(mountpoint));
+	if (add_state_type) {
+		json_object_object_add(j, "state", json_object_new_string(livesource_states[state]));
+		json_object_object_add(j, "type", json_object_new_string(livesource_types[type]));
+	}
 	return j;
 }
 
 /*
- * Return the full list of livesources as JSON.
+ * Return a local livesource structure as JSON.
  */
-struct mime_content *livesource_list_json(struct caster_state *caster, struct request *req) {
-	char *s;
+static json_object *livesource_json(struct livesource *this, enum livesource_update_type utype) {
+	json_object *j = _livesource_common_json(this->mountpoint, this->state, this->type, utype != LIVESOURCE_UPDATE_DEL);
+	if (utype == LIVESOURCE_UPDATE_NONE) {
+		json_object_object_add(j, "nsubscribers", json_object_new_int(this->nsubs));
+		json_object_object_add(j, "npackets", json_object_new_int(this->npackets));
+	}
+	return j;
+}
+
+/*
+ * Return a remote livesource structure as JSON.
+ */
+static json_object *livesource_remote_json(struct livesource_remote *this) {
+	return _livesource_common_json(this->mountpoint, this->state, this->type, 1);
+}
+
+/*
+ * Return the basic parameters of the local livesource list.
+ */
+static json_object *_livesource_list_base_json(struct livesources *this) {
+	json_object *j = json_object_new_object();
+	json_object_object_add(j, "hostname", json_object_new_string(this->hostname));
+	json_object_object_add(j, "serial", json_object_new_int64(this->serial));
+	json_object_object_add(j, "start_date", json_object_new_string(this->start_date));
+	return j;
+}
+
+/*
+ * Return the full list of local livesources as JSON.
+ */
+static json_object *livesource_list_local_json(struct livesources *this) {
 	json_object *jmain;
 	json_object *new_list;
 
-	jmain = json_object_new_object();
-	json_object_object_add(jmain, "hostname", json_object_new_string(caster->hostname));
-	json_object_object_add(jmain, "serial", json_object_new_int64(caster->livesources->serial));
-
-	char iso_date[30];
-	iso_date_from_timeval(iso_date, sizeof iso_date, &caster->start_date);
-	json_object_object_add(jmain, "start_date", json_object_new_string(iso_date));
+	jmain = _livesource_list_base_json(this);
 
 	new_list = json_object_new_object();
 	struct hash_iterator hi;
 	struct element *e;
-	P_RWLOCK_RDLOCK(&caster->livesources->lock);
-	HASH_FOREACH(e, caster->livesources->hash, hi) {
-		json_object *j = livesource_json((struct livesource *)e->value);
+	P_RWLOCK_RDLOCK(&this->lock);
+	HASH_FOREACH(e, this->hash, hi) {
+		json_object *j = livesource_json((struct livesource *)e->value, LIVESOURCE_UPDATE_NONE);
 		json_object_object_add(new_list, e->key, j);
 	}
-	P_RWLOCK_UNLOCK(&caster->livesources->lock);
+	P_RWLOCK_UNLOCK(&this->lock);
 	json_object_object_add(jmain, "livesources", new_list);
+	return jmain;
+}
 
+/*
+ * Return the full list of remote livesources as JSON.
+ */
+static json_object *_livesource_list_remote_json(struct livesources *this, struct livesources_remote *thisr) {
+	json_object *jmain;
+	json_object *new_list;
+
+	jmain = json_object_new_object();
+	json_object_object_add(jmain, "hostname", json_object_new_string(thisr->hostname));
+	json_object_object_add(jmain, "serial", json_object_new_int64(thisr->serial));
+	json_object_object_add(jmain, "start_date", json_object_new_string(thisr->start_date));
+
+	new_list = json_object_new_object();
+	struct hash_iterator hi;
+	struct element *e;
+	P_RWLOCK_RDLOCK(&this->lock);
+	HASH_FOREACH(e, thisr->hash, hi) {
+		json_object *j = livesource_remote_json((struct livesource_remote *)e->value);
+		json_object_object_add(new_list, e->key, j);
+	}
+	P_RWLOCK_UNLOCK(&this->lock);
+	json_object_object_add(jmain, "livesources", new_list);
+	return jmain;
+}
+
+/*
+ * Return the full list of livesources, local + remote, as JSON.
+ */
+static struct mime_content *_livesource_list_json(struct caster_state *caster) {
+	char *s;
+	json_object *jmain = json_object_new_object();
+
+	json_object *j = livesource_list_local_json(caster->livesources);
+	json_object_object_add(jmain, "LOCAL", j);
+
+	P_RWLOCK_RDLOCK(&caster->livesources->lock);
+	struct hash_iterator hi;
+	struct element *e;
+	HASH_FOREACH(e, caster->livesources->remote, hi) {
+		j = _livesource_list_remote_json(caster->livesources, (struct livesources_remote *)e->value);
+		json_object_object_add(jmain, e->key, j);
+	}
+	P_RWLOCK_UNLOCK(&caster->livesources->lock);
 	s = mystrdup(json_object_to_json_string(jmain));
 	struct mime_content *m = mime_new(s, -1, "application/json", 1);
 	json_object_put(jmain);
 	return m;
+}
+
+struct mime_content *livesource_list_json(struct caster_state *caster, struct request *req) {
+	return _livesource_list_json(caster);
+}
+
+/*
+ * Generate a JSON packet for a full table update.
+ */
+json_object *livesource_full_update_json(struct livesources *this) {
+	json_object *jmain = livesource_list_local_json(this);
+	json_object_object_add(jmain, "type", json_object_new_string("fulltable"));
+	return jmain;
+}
+
+/*
+ * Generate a JSON packet to request a serial + start_date check.
+ */
+json_object *livesource_checkserial_json(struct livesources *this) {
+	json_object *j = _livesource_list_base_json(this);
+	json_object_object_add(j, "type", json_object_new_string("checkserial"));
+	return j;
+}
+
+/*
+ * Generate a JSON incremental update packet from a local livesource record.
+ */
+static json_object *livesource_update_json(struct livesource *this,
+	struct caster_state *caster, enum livesource_update_type utype) {
+
+	json_object *j = json_object_new_object();
+	json_object *jl = livesource_json(this, utype);
+	json_object_object_add(j, "livesource", jl);
+
+	json_object_object_add(j, "start_date", json_object_new_string(caster->livesources->start_date));
+	json_object_object_add(j, "hostname", json_object_new_string(caster->livesources->hostname));
+	json_object_object_add(j, "serial", json_object_new_int64(caster->livesources->serial));
+	json_object_object_add(j, "type", json_object_new_string(livesource_update_types[utype]));
+
+	return j;
+}
+
+/*
+ * Send an update packet
+ */
+static void livesource_send_json(struct caster_state *caster, json_object *j) {
+	if (j == NULL)
+		return;
+	char *s = mystrdup(json_object_to_json_string(j));
+	json_object_put(j);
+
+	logfmt(&caster->flog, LOG_DEBUG, "livesource_send_json syncer %s", s);
+	if (s != NULL && caster->syncers_count >= 1)
+		syncer_queue(caster->syncers[0], s);
+	strfree(s);
+}
+
+/*
+ * Update receipt routines.
+ */
+
+static enum livesource_state convert_state(const char *state) {
+	const char **statep = livesource_states;
+	for (int i = 0; *statep; i++) {
+		if (!strcmp(*statep++, state))
+			return i;
+	}
+	return -1;
+}
+
+static enum livesource_type convert_type(const char *type) {
+	const char **typep = livesource_types;
+	for (int i = 0; *typep; i++) {
+		if (!strcmp(*typep++, type))
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * Execute a full table update.
+ */
+static int livesource_update_execute_fulltable(struct caster_state *caster, struct livesources *this, json_object *j, const char *hostname) {
+	struct json_object *lslist = json_object_object_get(j, "livesources");
+	struct json_object *jserial = json_object_object_get(j, "serial");
+	const char *start_date = json_object_get_string(json_object_object_get(j, "start_date"));
+
+	if (lslist == NULL || jserial == NULL || start_date == NULL || hostname == NULL)
+		return 503;
+
+	unsigned long serial = json_object_get_int64(jserial);
+	struct livesources_remote *remote = livesources_remote_new(hostname, start_date, serial);
+
+	struct json_object_iterator it;
+	struct json_object_iterator itEnd;
+
+	it = json_object_iter_begin(lslist);
+	itEnd = json_object_iter_end(lslist);
+
+	while (!json_object_iter_equal(&it, &itEnd)) {
+		const char *mountpoint = json_object_iter_peek_name(&it);
+		struct json_object *ls = json_object_iter_peek_value(&it);
+		const char *lstype = json_object_get_string(json_object_object_get(ls, "type"));
+		const char *lsstate = json_object_get_string(json_object_object_get(ls, "state"));
+
+		struct livesource_remote *lr = livesource_remote_new(mountpoint);
+		lr->state = convert_state(lsstate);
+		lr->type = convert_type(lstype);
+
+		hash_table_add(remote->hash, mountpoint, lr);
+
+		json_object_iter_next(&it);
+	}
+
+	hash_table_del(this->remote, hostname);
+	hash_table_add(this->remote, hostname, remote);
+	logfmt(&caster->flog, LOG_EDEBUG, "reload table %s serial %ld done", hostname, serial);
+
+	return 200;
+}
+
+/*
+ * Main routine to execute a received update.
+ */
+int livesource_update_execute(struct caster_state *caster, struct livesources *this, json_object *j) {
+	const char *type = json_object_get_string(json_object_object_get(j, "type"));
+	const char *hostname = json_object_get_string(json_object_object_get(j, "hostname"));
+
+	if (type == NULL || hostname == NULL) {
+		return 503;
+	}
+
+	if (!strcmp(type, "fulltable")) {
+		int r = livesource_update_execute_fulltable(caster, this, j, hostname);
+		json_object_put(j);
+		return r;
+	}
+
+	struct json_object *jserial = json_object_object_get(j, "serial");
+	struct json_object *jstart_date = json_object_object_get(j, "start_date");
+
+	if (jserial == NULL || jstart_date == NULL) {
+		json_object_put(j);
+		return 503;
+	}
+
+	unsigned long long serial = json_object_get_int64(jserial);
+
+	struct livesources_remote *lrlist = (struct livesources_remote *)hash_table_get(this->remote, hostname);
+
+	if (lrlist == NULL) {
+		logfmt(&caster->flog, LOG_NOTICE, "update failed, hostname %s not found", hostname);
+		json_object_put(j);
+		return 404;
+	}
+
+	const char *start_date = json_object_get_string(jstart_date);
+	if (strcmp(start_date, lrlist->start_date)) {
+		logfmt(&caster->flog, LOG_NOTICE, "bad start_date %s wanted %s", start_date, lrlist->start_date);
+		json_object_put(j);
+		return 404;
+	}
+
+	if (serial != lrlist->serial) {
+		logfmt(&caster->flog, LOG_NOTICE, "bad serial %llu wanted %llu", serial, lrlist->serial);
+		json_object_put(j);
+		return 404;
+	}
+
+	if (!strcmp(type, "checkserial"))
+		return 200;
+
+	struct json_object *ls = json_object_object_get(j, "livesource");
+	if (ls == NULL) {
+		logfmt(&caster->flog, LOG_NOTICE, "'livesource' not found");
+		json_object_put(j);
+		return 404;
+	}
+	const char *mountpoint = json_object_get_string(json_object_object_get(ls, "mountpoint"));
+
+	struct livesource_remote *lr = (struct livesource_remote *)hash_table_get(lrlist->hash, mountpoint);
+
+	if (!strcmp(type, "add")) {
+		if (lr) {
+			logfmt(&caster->flog, LOG_NOTICE, "update failed: %s exists", mountpoint);
+			json_object_put(j);
+			return 404;
+		}
+		lr = livesource_remote_new(mountpoint);
+		const char *lstype = json_object_get_string(json_object_object_get(ls, "type"));
+		const char *lsstate = json_object_get_string(json_object_object_get(ls, "state"));
+		lr->state = convert_state(lsstate);
+		lr->type = convert_type(lstype);
+		hash_table_add(lrlist->hash, mountpoint, lr);
+	} else if (!strcmp(type, "del")) {
+		if (!lr) {
+			logfmt(&caster->flog, LOG_NOTICE, "update failed: %s does not exist", mountpoint);
+			json_object_put(j);
+			return 503;
+		}
+		hash_table_del(lrlist->hash, mountpoint);
+	} else if (!strcmp(type, "update")) {
+		if (!lr) {
+			logfmt(&caster->flog, LOG_NOTICE, "update failed: %s does not exist", mountpoint);
+			json_object_put(j);
+			return 503;
+		}
+		const char *lstype = json_object_get_string(json_object_object_get(ls, "type"));
+		const char *lsstate = json_object_get_string(json_object_object_get(ls, "state"));
+		lr->state = convert_state(lsstate);
+		lr->type = convert_type(lstype);
+	} else {
+		logfmt(&caster->flog, LOG_NOTICE, "update failed: unknown type %s", type);
+		json_object_put(j);
+		return 503;
+	}
+
+	lrlist->serial++;
+	json_object_put(j);
+	return 200;
 }

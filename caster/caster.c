@@ -157,7 +157,8 @@ caster_alog(void *arg, struct gelf_entry *g, int dummy, const char *fmt, va_list
 static void
 caster_log_cb(void *arg, struct gelf_entry *g, int level, const char *fmt, va_list ap) {
 	struct caster_state *this = (struct caster_state *)arg;
-	if (level > this->config->log_level && level > this->config->graylog[0].log_level)
+	if (level > this->config->log_level
+	    && this->config->graylog_count && level > this->config->graylog[0].log_level)
 		return;
 	_caster_log(this, g, &this->flog, level, fmt, ap);
 }
@@ -213,7 +214,8 @@ caster_new(struct config *config, const char *config_file) {
 		return NULL;
 	}
 
-	this->livesources = livesource_table_new();
+	gethostname(this->hostname, sizeof(this->hostname));
+	this->livesources = livesource_table_new(this->hostname, &this->start_date);
 
 	P_RWLOCK_INIT(&this->ntrips.lock, NULL);
 	P_RWLOCK_INIT(&this->ntrips.free_lock, NULL);
@@ -256,6 +258,8 @@ caster_new(struct config *config, const char *config_file) {
 
 	this->graylog = NULL;
 	this->graylog_count = 0;
+	this->syncers = NULL;
+	this->syncers_count = 0;
 
 	fchdir(current_dir);
 	close(current_dir);
@@ -281,7 +285,6 @@ caster_new(struct config *config, const char *config_file) {
 	this->ntrips.n = 0;
 	this->ntrips.nfree = 0;
 	this->rtcm_cache = hash_table_new(509, (void(*)(void *))rtcm_info_free);
-	gethostname(this->hostname, sizeof(this->hostname));
 	this->hostname[sizeof(this->hostname)-1] = '\0';
 	TAILQ_INIT(&this->sourcetablestack.list);
 	return this;
@@ -324,6 +327,37 @@ static int caster_start_graylog(struct caster_state *this) {
 	return 0;
 }
 
+static int caster_start_syncers(struct caster_state *this) {
+	if (this->config->node_count == 0) {
+		this->syncers_count = 0;
+		return 0;
+	}
+	this->syncers_count = 1;
+	this->syncers = (struct syncer **)malloc(sizeof(struct syncer *)*this->syncers_count);
+	for (int i = 0; i < this->syncers_count; i++) {
+		this->syncers[i] = syncer_new(this,
+			this->config->node, this->config->node_count, "/adm/api/v1/sync", 10, 0, 1000);
+		for (int j = 0; j < this->config->node_count; j++)
+			syncer_start(this->syncers[i], j);
+	}
+	return 0;
+}
+
+static void caster_free_syncers(struct caster_state *this) {
+	if (this->syncers == NULL)
+		return;
+	for (int i = 0; i < this->syncers_count; i++)
+		syncer_free(this->syncers[i]);
+	free(this->syncers);
+	this->syncers_count = 0;
+	this->syncers = NULL;
+}
+
+static int caster_reload_syncers(struct caster_state *this) {
+	caster_free_syncers(this);
+	return caster_start_syncers(this);
+}
+
 static void caster_free_graylog(struct caster_state *this) {
 	for (int i = 0; i < this->graylog_count; i++)
 		graylog_sender_free(this->graylog[i]);
@@ -363,6 +397,7 @@ void caster_free(struct caster_state *this) {
 		event_free(this->signalint_event);
 
 	caster_free_graylog(this);
+	caster_free_syncers(this);
 	caster_free_listeners(this);
 	hash_table_free(this->ntrips.ipcount);
 	livesource_table_free(this->livesources);
@@ -769,6 +804,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 
 	st->ssl = ssl;
 	st->bev_close_on_free = 1;
+	st->connection_keepalive = 1;
 	ntrip_set_peeraddr(st, sa, socklen);
 	ntrip_set_localaddr(st);
 
@@ -817,6 +853,8 @@ int caster_reload(struct caster_state *this) {
 	if (caster_reload_fetchers(this) < 0)
 		r = -1;
 	if (caster_reload_graylog(this) < 0)
+		r = -1;
+	if (caster_reload_syncers(this) < 0)
 		r = -1;
 	if (caster_chdir_reload(this, 1) < 0)
 		r = -1;
@@ -1006,6 +1044,7 @@ int caster_main(char *config_file) {
 
 	caster_start_fetchers(caster);
 	caster_start_graylog(caster);
+	caster_start_syncers(caster);
 
 	event_base_dispatch(caster->base);
 
