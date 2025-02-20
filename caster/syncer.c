@@ -31,7 +31,7 @@ static void queue_json(struct syncer *this, int n, json_object *j) {
  */
 static void queue_full(struct syncer *this, int n) {
 	struct ntrip_task *task = this->task[n];
-	json_object *j = livesource_full_update_json(task->caster->livesources);
+	json_object *j = livesource_full_update_json(task->caster, task->caster->livesources);
 	logfmt(&task->caster->flog, LOG_DEBUG, "syncer queue full table, serial %lld", task->caster->livesources->serial);
 	queue_json(this, n, j);
 }
@@ -61,6 +61,8 @@ void syncer_queue(struct syncer *this, char *json) {
 
 /*
  * Callback called at the end of the http session.
+ *
+ * Required lock: ntrip_state
  */
 static void
 end_cb(int ok, void *arg, int n) {
@@ -97,7 +99,7 @@ status_cb(void *arg, int status, int n) {
  */
 struct syncer *syncer_new(struct caster_state *caster,
 	struct config_node *node, int node_count, const char *uri,
-	int retry_delay, int bulk_max_size, int queue_max_size) {
+	int retry_delay, int bulk_max_size) {
 
 	if (bulk_max_size != 0)
 		/* Not yet implemented on the API side */
@@ -130,7 +132,7 @@ struct syncer *syncer_new(struct caster_state *caster,
 		snprintf(authkey, authkeylen, "internal %s", node[i].authorization);
 
 		this->task[i] = ntrip_task_new(caster, node[i].host, node[i].port, uri,
-			node[i].tls, 10, bulk_max_size, queue_max_size, "syncer", NULL);
+			node[i].tls, 10, bulk_max_size, node[i].queue_max_size, "syncer", NULL);
 		if (evhttp_add_header(&this->task[i]->headers, "Authorization", authkey) < 0)
 			err = 1;
 		strfree(authkey);
