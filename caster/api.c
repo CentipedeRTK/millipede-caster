@@ -1,11 +1,12 @@
 #include <netinet/tcp.h>
 
-#include <json-c/json.h>
+#include <json-c/json_object.h>
 
 #include "conf.h"
 #include "livesource.h"
 #include "ntrip_common.h"
 #include "rtcm.h"
+#include "sourcetable.h"
 
 /*
  * JSON API routines.
@@ -151,27 +152,9 @@ struct mime_content *api_drop_json(struct caster_state *caster, struct request *
 	long long id = -1;
 	char *idval = (char *)hash_table_get(req->hash, "id");
 
-	if (id && sscanf(idval, "%lld", &id) == 1) {
-		struct ntrip_state *st;
-		P_RWLOCK_RDLOCK(&caster->ntrips.lock);
-		TAILQ_FOREACH(st, &caster->ntrips.queue, nextg) {
-			struct bufferevent *bev = st->bev;
-			bufferevent_lock(bev);
-			if (st->id > id) {
-				bufferevent_unlock(bev);
-				break;
-			}
-			if (st->id == id) {
-				ntrip_notify_close(st);
-				ntrip_deferred_free(st, "ntrip_drop_json");
-				bufferevent_unlock(bev);
-				r = 1;
-				break;
-			}
-			bufferevent_unlock(bev);
-		}
-		P_RWLOCK_UNLOCK(&caster->ntrips.lock);
-	}
+	if (id && sscanf(idval, "%lld", &id) == 1)
+		r = ntrip_drop_by_id(caster, id);
+
 	snprintf(result, sizeof result, "{\"result\": %d}\n", r);
 	char *s = mystrdup(result);
 	struct mime_content *m = mime_new(s, -1, "application/json", 1);
@@ -179,7 +162,12 @@ struct mime_content *api_drop_json(struct caster_state *caster, struct request *
 }
 
 struct mime_content *api_sync_json(struct caster_state *caster, struct request *req) {
-	req->status = livesource_update_execute(caster, caster->livesources, req->json);
+	const char *type = json_object_get_string(json_object_object_get(req->json, "type"));
+
+	if (!strcmp(type, "sourcetable")) {
+		req->status = sourcetable_update_execute(caster, req->json);
+	} else
+		req->status = livesource_update_execute(caster, caster->livesources, req->json);
 	char *s = mystrdup("");
 	struct mime_content *m = mime_new(s, -1, "application/json", 1);
 	return m;
