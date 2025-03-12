@@ -380,11 +380,19 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 							ntrip_log(st, LOG_INFO, "Can't decode Authorization");
 						}
 					}
+				} else if (!strcasecmp(key, "ntrip-gga")) {
+					pos_t pos;
+					ntrip_log(st, LOG_EDEBUG, "Header GGA? \"%s\"", value);
+					if (parse_gga(value, &pos) >= 0) {
+						st->last_pos = pos;
+						st->last_pos_valid = 1;
+					}
 				} else {
 					ntrip_log(st, LOG_EDEBUG, "Header %s: %s", key, value);
 				}
 			} else {
 				ntrip_log(st, LOG_EDEBUG, "[End headers]");
+
 				if (st->client_version == 1)
 					st->connection_keepalive = 0;
 				if (st->chunk_state == CHUNK_INIT && ntrip_chunk_decode_init(st) < 0) {
@@ -471,6 +479,11 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						/* Regular NTRIP stream client: disable read and write timeouts */
 						bufferevent_set_timeouts(bev, NULL, NULL);
 					}
+
+					/* If we have a position (Ntrip-gga header), use it */
+
+					if (st->last_pos_valid)
+						joblist_append_ntrip_locked(st->caster->joblist, st, &ntripsrv_redo_virtual_pos);
 
 					/*
 					 * We only limit the send buffer on NTRIP clients, except for the sourcetable.
