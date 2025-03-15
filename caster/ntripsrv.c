@@ -9,6 +9,7 @@
 #include "ntripsrv.h"
 #include "adm.h"
 #include "caster.h"
+#include "file.h"
 #include "http.h"
 #include "jobs.h"
 #include "ntrip_common.h"
@@ -68,7 +69,7 @@ send_server_reply(struct ntrip_state *this, struct evbuffer *ev,
 		len = evbuffer_add_printf(ev, "Content-Length: %lu\r\n", m->len);
 		if (len > 0) sent += len;
 	}
-	if (this->connection_keepalive) {
+	if (this->connection_keepalive && this->received_keepalive) {
 		evbuffer_add_reference(ev, "Connection: keep-alive\r\n", 24, NULL, NULL);
 		len += 24;
 	} else {
@@ -422,18 +423,33 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						break;
 					}
 
-					st->connection_keepalive = 0;
+					if (st->caster->config->webroots_count) {
+						if (filesrv(st, st->http_args[1], &err, &opt_headers) >= 0 || err)
+							break;
+					}
+
 					char *mountpoint = st->http_args[1]+1;
 					struct sourceline *sourceline = NULL;
-					if (*mountpoint)
+					struct livesource *l = NULL;
+
+					if (*mountpoint) {
 						sourceline = stack_find_mountpoint(st->caster, &st->caster->sourcetablestack, mountpoint);
 
+						if (!sourceline)
+							/*
+							 * Not in the sourcetables, try to use a current live source (probably a wildcard),
+							 * if any.
+							 */
+							l = livesource_find_and_subscribe(st->caster, st, mountpoint, NULL, 0);
+					}
+
 					/*
-					 * Source not found: reply with the sourcetable in NTRIP1, 404 in NTRIP2.
+					 * Source not found either in the sourcetables or a a live source:
+					 * reply with the sourcetable in NTRIP1, error 404 in NTRIP2.
 					 *
 					 * Empty mountpoint name: always reply with the sourcetable.
 					 */
-					if (*mountpoint == '\0' || (!sourceline && st->client_version == 1)) {
+					if (*mountpoint == '\0' || (!sourceline && !l && st->client_version == 1)) {
 						st->type = "client";
 						err = ntripsrv_send_sourcetable(st, output);
 						if (st->connection_keepalive && st->received_keepalive) {
@@ -447,16 +463,29 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 							break;
 						}
 					}
-					if (!sourceline) {
+					st->connection_keepalive = 0;
+					if (!sourceline && !l) {
 						err = 404;
 						break;
 					}
-					st->source_virtual = sourceline->virtual;
-					st->source_on_demand = sourceline->on_demand;
+
+					pos_t pos;
+					if (sourceline) {
+						st->source_virtual = sourceline->virtual;
+						st->source_on_demand = sourceline->on_demand;
+						pos = sourceline->pos;
+					} else {
+						st->source_virtual = 0;
+						st->source_on_demand = 0;
+						pos.lat = 0.0;
+						pos.lon = 0.0;
+					}
 
 					st->type = "client";
+
 					if (!st->source_virtual) {
-						struct livesource *l = livesource_find_and_subscribe(st->caster, st, mountpoint, &sourceline->pos, st->source_on_demand);
+						if (l == NULL)
+							l = livesource_find_and_subscribe(st->caster, st, mountpoint, &pos, st->source_on_demand);
 						if (l) {
 							ntrip_log(st, LOG_DEBUG, "Found requested source %s, on_demand=%d", mountpoint, st->source_on_demand);
 							ntripsrv_send_stream_result_ok(st, output, "gnss/data", NULL);
