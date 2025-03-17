@@ -32,6 +32,7 @@ static struct httpcode httpcodes[] = {
 	{401, "Unauthorized"},
 	{404, "Not Found"},
 	{409, "Conflict"},
+	{413, "Content Too Large"},
 	{500, "Internal Server Error"},
 	{501, "Not Implemented"},
 	{503, "Service Unavailable"},
@@ -270,7 +271,7 @@ void ntripsrv_redo_virtual_pos(struct ntrip_state *arg) {
 				ntrip_log(st, LOG_INFO, "Virtual source ignoring switch from %s to %s due to %.2f hysteresis", st->virtual_mountpoint, m, st->caster->config->hysteresis_m);
 			} else {
 				enum livesource_state source_state;
-				struct livesource *l = livesource_find_on_demand(st->caster, st, m, &s->dist_array[0].pos, s->dist_array[0].on_demand, &source_state);
+				struct livesource *l = livesource_find_on_demand(st->caster, st, m, &s->dist_array[0].pos, 1, s->dist_array[0].on_demand, &source_state);
 				if (l && (source_state == LIVESOURCE_RUNNING || (s->dist_array[0].on_demand && source_state == LIVESOURCE_FETCH_PENDING))) {
 					if (redistribute_switch_source(st, m, &s->dist_array[0].pos, l) < 0)
 						ntrip_log(st, LOG_NOTICE, "Unable to switch source from %s to %s", st->virtual_mountpoint, m);
@@ -356,7 +357,15 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						st->received_keepalive = 1;
 				} else if (!strcasecmp(key, "content-length")) {
 					unsigned long content_length;
+					int length_err;
 					if (sscanf(value, "%lu", &content_length) == 1) {
+						length_err = (content_length > st->caster->config->http_content_length_max);
+						if (length_err) {
+							ntrip_log(st, LOG_NOTICE, "Content-Length %d: exceeds max configured value %d",
+								content_length, st->caster->config->http_content_length_max);
+							err = 413;
+							break;
+						}
 						st->content_length = content_length;
 						st->content_done = 0;
 					}
@@ -433,14 +442,11 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					struct livesource *l = NULL;
 
 					if (*mountpoint) {
+						/*
+						 * Find both a relevant source line and a live source (actually live or on-demand).
+						 */
 						sourceline = stack_find_mountpoint(st->caster, &st->caster->sourcetablestack, mountpoint);
-
-						if (!sourceline)
-							/*
-							 * Not in the sourcetables, try to use a current live source (probably a wildcard),
-							 * if any.
-							 */
-							l = livesource_find_and_subscribe(st->caster, st, mountpoint, NULL, 0);
+						l = livesource_find_and_subscribe(st->caster, st, mountpoint, NULL, 1, sourceline?sourceline->on_demand:0);
 					}
 
 					/*
@@ -476,7 +482,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						pos = sourceline->pos;
 					} else {
 						st->source_virtual = 0;
-						st->source_on_demand = 0;
+						st->source_on_demand = 1;
 						pos.lat = 0.0;
 						pos.lon = 0.0;
 					}
@@ -484,8 +490,6 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					st->type = "client";
 
 					if (!st->source_virtual) {
-						if (l == NULL)
-							l = livesource_find_and_subscribe(st->caster, st, mountpoint, &pos, st->source_on_demand);
 						if (l) {
 							ntrip_log(st, LOG_DEBUG, "Found requested source %s, on_demand=%d", mountpoint, st->source_on_demand);
 							ntripsrv_send_stream_result_ok(st, output, "gnss/data", NULL);
