@@ -127,9 +127,16 @@ void joblist_run(struct joblist *this) {
 				j->redistribute.cb(j->redistribute.arg);
 			else if (j->type == JOB_NTRIP_UNLOCKED)
 				j->ntrip_unlocked.cb(j->ntrip_unlocked.st);
-			else if (j->type == JOB_NTRIP_UNLOCKED_CONTENT)
+			else if (j->type == JOB_NTRIP_UNLOCKED_CONTENT) {
 				j->ntrip_unlocked_content.cb(j->ntrip_unlocked_content.st, j->ntrip_unlocked_content.content_cb, j->ntrip_unlocked_content.req);
-			else if (j->type == JOB_STOP_THREAD) {
+				struct ntrip_state *st = j->ntrip_unlocked_content.st;
+				struct bufferevent *bev = st->bev;
+				bufferevent_lock(bev);
+				st->ref--;
+				if (st->ref == 0)
+					ntrip_deferred_free(st, "joblist_run");
+				bufferevent_unlock(bev);
+			} else if (j->type == JOB_STOP_THREAD) {
 				logfmt(&this->caster->flog, LOG_INFO, "Exiting thread %d", (long)pthread_getspecific(this->caster->thread_id));
 				pthread_exit(NULL);
 			}
@@ -440,6 +447,7 @@ void joblist_append_ntrip_unlocked_content(
 		tmpj.ntrip_unlocked_content.st = st;
 		tmpj.ntrip_unlocked_content.content_cb = content_cb;
 		tmpj.ntrip_unlocked_content.req = req;
+		st->ref++;
 		_joblist_append_generic(this, NULL, &tmpj);
 	} else
 		cb(st, content_cb, req);

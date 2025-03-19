@@ -79,6 +79,9 @@ struct ntrip_state {
 	struct timeval start;	// time the connection was established
 	unsigned long long received_bytes, sent_bytes;
 
+	// reference count used in threaded mode for deferred calls
+	int ref;
+
 	/* linked-list pointers for main job queue */
 	STAILQ_ENTRY(ntrip_state) next;
 	/* job list for this particular session */
@@ -209,6 +212,9 @@ struct ntrip_state {
 	pos_t last_pos;				// last known position
 	float last_dist;			// last known base distance (for hysteresis)
 	float max_min_dist;			// maximum distance to the closest base
+	// date and position last used for recomputing the nearest base
+	struct timeval last_recompute_date;
+	pos_t last_recompute_pos;
 
 	/*
 	 * Virtual mountpoint handling

@@ -56,6 +56,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->source_virtual = 0;
 	this->source_on_demand = 0;
 	this->last_pos_valid = 0;
+	memset(&this->last_recompute_date, 0, sizeof(this->last_recompute_date));
 	this->max_min_dist = 0;
 	this->user = NULL;
 	this->password = NULL;
@@ -70,6 +71,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 		STAILQ_INIT(&this->jobq);
 	this->njobs = 0;
 	this->newjobs = 0;
+	this->ref = 1;
 	this->bev_freed = 0;
 	this->bev_close_on_free = 0;
 	this->bev = bev;
@@ -359,6 +361,10 @@ static void ntrip_deferred_free2(struct ntrip_state *this) {
  * Required locks: bufferevent, ntrip_state
  */
 void ntrip_deferred_free(struct ntrip_state *this, char *orig) {
+	this->ref--;
+	if (this->ref)
+		return;
+
 	if (this->state == NTRIP_END) {
 		ntrip_log(this, LOG_EDEBUG, "double call to ntrip_deferred_free from %s", orig);
 		return;
