@@ -4,6 +4,7 @@
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -20,8 +21,8 @@ struct joblist *joblist_new(struct caster_state *caster) {
 	struct joblist *this = (struct joblist *)malloc(sizeof(struct joblist));
 	if (this != NULL) {
 		if (pthread_cond_init(&this->condjob, NULL) != 0) {
-			free(this);
 			caster_log_error(this->caster, "pthread_cond_init");
+			free(this);
 			return NULL;
 		}
 		this->ntrip_njobs = 0;
@@ -43,6 +44,17 @@ struct joblist *joblist_new(struct caster_state *caster) {
 }
 
 /*
+ * Remove all references to a ntrip_state so it can be freed.
+ */
+static void _ntrip_decref(struct ntrip_state *st) {
+	struct bufferevent *bev = st->bev;
+	bufferevent_lock(bev);
+	ntrip_deferred_free(st, "joblist_run");
+	bufferevent_unlock(bev);
+	bufferevent_decref(bev);
+}
+
+/*
  * Required lock: ntrip_state
  */
 static int _joblist_drain(struct jobq *jobq) {
@@ -50,6 +62,8 @@ static int _joblist_drain(struct jobq *jobq) {
 	int n = 0;
 	while ((j = STAILQ_FIRST(jobq))) {
 		STAILQ_REMOVE_HEAD(jobq, next);
+		if (j->type == JOB_NTRIP_UNLOCKED_CONTENT)
+			_ntrip_decref(j->ntrip_unlocked_content.st);
 		n++;
 		free(j);
 	}
@@ -129,13 +143,7 @@ void joblist_run(struct joblist *this) {
 				j->ntrip_unlocked.cb(j->ntrip_unlocked.st);
 			else if (j->type == JOB_NTRIP_UNLOCKED_CONTENT) {
 				j->ntrip_unlocked_content.cb(j->ntrip_unlocked_content.st, j->ntrip_unlocked_content.content_cb, j->ntrip_unlocked_content.req);
-				struct ntrip_state *st = j->ntrip_unlocked_content.st;
-				struct bufferevent *bev = st->bev;
-				bufferevent_lock(bev);
-				st->ref--;
-				if (st->ref == 0)
-					ntrip_deferred_free(st, "joblist_run");
-				bufferevent_unlock(bev);
+				_ntrip_decref(j->ntrip_unlocked_content.st);
 			} else if (j->type == JOB_STOP_THREAD) {
 				logfmt(&this->caster->flog, LOG_INFO, "Exiting thread %d", (long)pthread_getspecific(this->caster->thread_id));
 				pthread_exit(NULL);
@@ -536,7 +544,7 @@ int jobs_start_threads(struct joblist *this, int nthreads) {
 void jobs_stop_threads(struct joblist *this) {
 	for (int i = 0; i < this->nthreads; i++) {
 		joblist_append_stop(this);
-		pthread_yield();
+		sched_yield();
 	}
 
 	int r, nlive;

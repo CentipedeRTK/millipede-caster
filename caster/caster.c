@@ -654,15 +654,14 @@ static int caster_reload_listeners(struct caster_state *this) {
 
 static int
 caster_reload_sourcetables(struct caster_state *caster) {
-	int r = 0;
 	struct sourcetable *s;
 	struct sourcetable *stmp;
 
 	struct sourcetable *local_table
-		= sourcetable_read(caster->config->sourcetable_filename, caster->config->sourcetable_priority);
+		= sourcetable_read(caster, caster->config->sourcetable_filename, caster->config->sourcetable_priority);
 
 	if (local_table == NULL)
-		r = -1;
+		return -1;
 
 	P_RWLOCK_WRLOCK(&caster->sourcetablestack.lock);
 
@@ -683,7 +682,7 @@ caster_reload_sourcetables(struct caster_state *caster) {
 
 	P_RWLOCK_UNLOCK(&caster->sourcetablestack.lock);
 
-	return r;
+	return 0;
 }
 
 static int
@@ -861,11 +860,6 @@ signal_cb(evutil_socket_t sig, short events, void *user_data) {
 	event_base_loopexit(base, &delay);
 }
 
-static void
-signalpipe_cb(evutil_socket_t sig, short events, void *user_data) {
-	printf("Caught SIGPIPE\n");
-}
-
 int caster_reload(struct caster_state *this) {
 	int r = 0;
 	if (caster_reload_config(this) < 0)
@@ -907,11 +901,7 @@ static int caster_set_signals(struct caster_state *this) {
 		return -1;
 	}
 
-	this->signalpipe_event = evsignal_new(this->base, SIGPIPE, signalpipe_cb, (void *)this->base);
-	if (!this->signalpipe_event || event_add(this->signalpipe_event, NULL) < 0) {
-		fprintf(stderr, "Could not create/add a signal event!\n");
-		return -1;
-	}
+	signal(SIGPIPE, SIG_IGN);
 
 	this->signalhup_event = evsignal_new(this->base, SIGHUP, signalhup_cb, (void *)this);
 	if (!this->signalhup_event || event_add(this->signalhup_event, 0) < 0) {
