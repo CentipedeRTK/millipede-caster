@@ -31,6 +31,7 @@ static struct httpcode httpcodes[] = {
 	{400, "Bad Request"},
 	{401, "Unauthorized"},
 	{404, "Not Found"},
+	{405, "Method Not Allowed"},
 	{409, "Conflict"},
 	{413, "Content Too Large"},
 	{431, "Request Header Fields Too Large"},
@@ -451,7 +452,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					}
 					if (strlen(st->http_args[1]) >= 5 && !memcmp(st->http_args[1], "/adm/", 5)) {
 						st->type = "adm";
-						admsrv(st, "GET", "/adm", st->http_args[1] + 4, &err, &opt_headers);
+						admsrv(st, st->http_args[0], "/adm", st->http_args[1] + 4, &err, &opt_headers);
 						break;
 					}
 
@@ -662,7 +663,11 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 			st->received_bytes += len;
 			if (st->content_done == st->content_length) {
 				st->content[st->content_length] = '\0';
-				admsrv(st, "POST", "/adm", st->http_args[1] + 4, &err, &opt_headers);
+				if (strlen(st->http_args[1]) >= 5 && !memcmp(st->http_args[1], "/adm/", 5)) {
+					st->type = "adm";
+					admsrv(st, st->http_args[0], "/adm", st->http_args[1] + 4, &err, &opt_headers);
+				}
+				st->state = NTRIP_WAIT_HTTP_METHOD;
 			}
 		} else if (st->state == NTRIP_WAIT_STREAM_SOURCE) {
 			// will increment st->received_bytes itself
@@ -679,33 +684,14 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 		free(line);
 
 	if (err) {
-		if (err == 400)
-			send_server_reply(st, output, 400, NULL, NULL, NULL);
-		else if (err == 401) {
-			if (st->client_version == 1 && method_post_source)
-				evbuffer_add_reference(output, "ERROR - Bad Password\r\n", 22, NULL, NULL);
-			else {
-				send_server_reply(st, output, 401, &opt_headers, NULL, NULL);
-				evbuffer_add_reference(output, "401\r\n", 5, NULL, NULL);
-			}
-		} else if (err == 404) {
-			if (st->client_version == 1 && method_post_source)
-				evbuffer_add_reference(output, "ERROR - Mount Point Taken or Invalid\r\n", 38, NULL, NULL);
-			else
-				send_server_reply(st, output, 404, NULL, NULL, NULL);
-		} else if (err == 409) {
-			if (st->client_version == 1 && method_post_source)
-				evbuffer_add_reference(output, "ERROR - Mount Point Taken or Invalid\r\n", 38, NULL, NULL);
-			else
-				send_server_reply(st, output, 409, NULL, NULL, NULL);
-		} else if (err == 500)
-			send_server_reply(st, output, 500, NULL, NULL, NULL);
-		else if (err == 501)
-			send_server_reply(st, output, 501, NULL, NULL, NULL);
-		else if (err == 503)
-			send_server_reply(st, output, 503, NULL, NULL, NULL);
+		if (err == 401 && st->client_version == 1 && method_post_source)
+			evbuffer_add_reference(output, "ERROR - Bad Password\r\n", 22, NULL, NULL);
+		else if (err == 404 && st->client_version == 1 && method_post_source)
+			evbuffer_add_reference(output, "ERROR - Mount Point Taken or Invalid\r\n", 38, NULL, NULL);
+		else if (err == 409 && st->client_version == 1 && method_post_source)
+			evbuffer_add_reference(output, "ERROR - Mount Point Taken or Invalid\r\n", 38, NULL, NULL);
 		else
-			send_server_reply(st, output, err, NULL, NULL, NULL);
+			send_server_reply(st, output, err, &opt_headers, NULL, NULL);
 		ntrip_log(st, LOG_EDEBUG, "ntripsrv_readcb err %d", err);
 		st->state = NTRIP_WAIT_CLOSE;
 	}
