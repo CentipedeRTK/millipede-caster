@@ -22,18 +22,24 @@ struct sourcetable *sourcetable_read(struct caster_state *caster, const char *fi
 	ssize_t linelen;
 	int nlines = 0;
 
-	FILE *fp = fopen(filename, "r+");
+	FILE *fp = fopen(filename, "r");
 	if (fp == NULL) {
 		logfmt(&caster->flog, LOG_ERR, "Can't open %s", filename);
 		return NULL;
 	}
 
 	struct sourcetable *tmp_sourcetable = sourcetable_new("LOCAL", 0, 0);
+	if (tmp_sourcetable == NULL) {
+		logfmt(&caster->flog, LOG_ERR, "Can't read %s: out of memory", filename);
+		fclose(fp);
+		return NULL;
+	}
+
 	tmp_sourcetable->local = 1;
 	tmp_sourcetable->filename = mystrdup(filename);
 	while ((linelen = getline(&line, &linecap, fp)) > 0) {
 		nlines++;
-		for (; line[linelen-1] == '\n' || line[linelen-1] == '\r'; linelen--)
+		for (; linelen && (line[linelen-1] == '\n' || line[linelen-1] == '\r'); linelen--)
 			line[linelen-1] = '\0';
 		if (linelen == 0)
 			/* Skip empty line */
@@ -45,10 +51,13 @@ struct sourcetable *sourcetable_read(struct caster_state *caster, const char *fi
 			continue;
 		if (sourcetable_add(tmp_sourcetable, line, 0, caster) < 0) {
 			logfmt(&caster->flog, LOG_ERR, "Can't parse line %d in sourcetable", nlines);
+			strfree(line);
 			sourcetable_free(tmp_sourcetable);
+			fclose(fp);
 			return NULL;
 		}
 	}
+	fclose(fp);
 	tmp_sourcetable->priority = priority;
 	strfree(line);
 	return tmp_sourcetable;
