@@ -15,7 +15,7 @@ struct caster_state;
  * A source table
  */
 struct sourcetable {
-	TAILQ_ENTRY(sourcetable) next;
+	TAILQ_ENTRY(sourcetable) next;	// ordered by decreasing priority
 	P_RWLOCK_T lock;
 
 	char *caster;                   // from which caster hostname did we get this table
@@ -54,18 +54,11 @@ struct spos {
  * Table to determine the closest base from a rover
  */
 struct dist_table {
-	struct sourcetable *sourcetable;	// original sourcetable
 	pos_t pos;				// known rover position
 	struct spos *dist_array;		// array of distances
 	int size_dist_array;
-};
-
-/*
- * Priority structure for sourcetable_stack_flatten.
- */
-struct mp_prio {
-	struct sourceline *sourceline;
-	int priority;
+	const char *host;
+	unsigned short port;
 };
 
 struct sourcetable *sourcetable_read(struct caster_state *caster, const char *filename, int priority);
@@ -86,6 +79,7 @@ struct sourceline *stack_find_mountpoint(struct caster_state *caster, sourcetabl
 struct sourceline *stack_find_local_mountpoint(struct caster_state *caster, sourcetable_stack_t *stack, char *mountpoint);
 struct sourceline *stack_find_pullable(sourcetable_stack_t *stack, char *mountpoint, struct sourcetable **sourcetable);
 void stack_replace_host(struct caster_state *caster, sourcetable_stack_t *stack, const char *host, unsigned port, struct sourcetable *new_sourcetable);
+struct sourcetable *stack_flatten_dist(struct caster_state *caster, sourcetable_stack_t *this, pos_t *pos, float max_dist);
 struct sourcetable *stack_flatten(struct caster_state *caster, sourcetable_stack_t *this);
 struct mime_content *sourcetable_list_json(struct caster_state *caster, struct request *req);
 int sourcetable_update_execute(struct caster_state *caster, json_object *j);

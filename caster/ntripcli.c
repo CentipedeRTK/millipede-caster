@@ -234,6 +234,8 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 					st->state = NTRIP_WAIT_CALLBACK_LINE;
 				else if (st->content_length)
 					st->state = NTRIP_WAIT_SERVER_CONTENT;
+				else if (st->chunk_state != CHUNK_NONE && st->chunk_state != CHUNK_END)
+					st->state = NTRIP_WAIT_CHUNKED_CONTENT;
 				else if (st->connection_keepalive && st->received_keepalive) {
 					st->state = NTRIP_IDLE_CLIENT;
 					if (st->task)
@@ -298,12 +300,29 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 				evbuffer_drain(st->input, len);
 				st->received_bytes += len;
 				st->content_done += len;
-			} else if (st->connection_keepalive && st->received_keepalive) {
+			}
+			if (st->content_length == st->content_done && st->connection_keepalive && st->received_keepalive) {
 				st->state = NTRIP_IDLE_CLIENT;
 				if (st->task)
 					ntrip_task_send_next_request(st);
 			} else
 				end = 1;
+		} else if (st->state == NTRIP_WAIT_CHUNKED_CONTENT) {
+			if (st->chunk_state == CHUNK_END) {
+				if (st->connection_keepalive && st->received_keepalive) {
+					st->state = NTRIP_IDLE_CLIENT;
+					if (st->task)
+						ntrip_task_send_next_request(st);
+				} else
+					end = 1;
+			} else {
+				len = waiting_len;
+				if (len) {
+					evbuffer_drain(st->input, len);
+					st->received_bytes += len;
+					st->content_done += len;
+				}
+			}
 		} else if (st->state == NTRIP_IDLE_CLIENT) {
 			len = waiting_len;
 			if (len) {
@@ -311,7 +330,9 @@ void ntripcli_readcb(struct bufferevent *bev, void *arg) {
 				char data[65];
 				data[64] = '\0';
 				ntrip_log(st, LOG_NOTICE, "Server sent %d bytes on idle connection, closing", len);
-				evbuffer_remove(st->input, data, len > 64 ? 64:len);
+				int rlen = len > 64 ? 64:len;
+				evbuffer_remove(st->input, data, rlen);
+				data[rlen] = '\0';
 				ntrip_log(st, LOG_INFO, "Data (truncated to 64 bytes): \"%s\"", data);
 				end = 1;
 			}

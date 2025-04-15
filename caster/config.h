@@ -55,6 +55,8 @@ struct config_node {
 
 	/* Maximum queue size for memory backlog */
 	size_t queue_max_size;
+
+	int retry_delay;
 };
 
 struct config_endpoint {
@@ -108,6 +110,18 @@ struct config {
 	 * Hysteresis distance in meters for virtual source switch.
 	 */
 	float hysteresis_m;
+
+	/*
+	 * Max distance to prune the sourcetable when computing the
+	 * nearest bases.
+	 */
+	float max_nearest_lookup_distance_m;
+
+	/*
+	 * Number of bases to aim for (by adjusting the lookup distance)
+	 * for nearest base computation.
+	 */
+	int nearest_base_count_target;
 
 	/*
 	 * Min & max recompute interval for nearest base, in seconds.

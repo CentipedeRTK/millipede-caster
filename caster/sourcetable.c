@@ -37,6 +37,7 @@ struct sourcetable *sourcetable_read(struct caster_state *caster, const char *fi
 
 	tmp_sourcetable->local = 1;
 	tmp_sourcetable->filename = mystrdup(filename);
+	tmp_sourcetable->priority = priority;
 	while ((linelen = getline(&line, &linecap, fp)) > 0) {
 		nlines++;
 		for (; linelen && (line[linelen-1] == '\n' || line[linelen-1] == '\r'); linelen--)
@@ -58,7 +59,6 @@ struct sourcetable *sourcetable_read(struct caster_state *caster, const char *fi
 		}
 	}
 	fclose(fp);
-	tmp_sourcetable->priority = priority;
 	strfree(line);
 	return tmp_sourcetable;
 }
@@ -357,6 +357,32 @@ void sourcetable_diff(struct caster_state *caster, struct sourcetable *t1, struc
 	hash_array_free(keys2);
 }
 
+static struct dist_table *dist_table_new(int n, const char *host, unsigned short port) {
+	struct dist_table *this = (struct dist_table *)malloc(sizeof(struct dist_table));
+	if (this == NULL)
+		return NULL;
+
+	struct spos *dist_array = (struct spos *)malloc(sizeof(struct spos)*n);
+	if (dist_array == NULL) {
+		free(this);
+		return NULL;
+	}
+	this->dist_array = dist_array;
+
+	this->size_dist_array = 0;
+	this->port = port;
+	this->host = host?mystrdup(host):NULL;
+	return this;
+}
+
+static void dist_table_add(struct dist_table *this, double dist, pos_t *pos, char *mountpoint, int on_demand) {
+	int i = this->size_dist_array++;
+	this->dist_array[i].dist = dist;
+	this->dist_array[i].pos = *pos;
+	this->dist_array[i].mountpoint = mountpoint;
+	this->dist_array[i].on_demand = on_demand;
+}
+
 static int _cmp_dist(const void *pos1, const void *pos2) {
 	struct spos *p1 = (struct spos *)pos1;
 	struct spos *p2 = (struct spos *)pos2;
@@ -385,61 +411,40 @@ struct dist_table *sourcetable_find_pos(struct sourcetable *this, pos_t *pos) {
 	 */
 	n = _sourcetable_nentries_unlocked(this, 1);
 
-	if (n == 0) {
-		P_RWLOCK_UNLOCK(&this->lock);
-		return NULL;
-	}
-
 	/*
 	 * Allocate the table structures.
 	 */
-	struct dist_table *d = (struct dist_table *)malloc(sizeof(struct dist_table));
+	struct dist_table *d = dist_table_new(n, this->caster, this->port);
 	if (d == NULL) {
 		P_RWLOCK_UNLOCK(&this->lock);
-		return NULL;
-	}
-	struct spos *dist_array = (struct spos *)malloc(sizeof(struct spos)*n);
-	if (dist_array == NULL) {
-		P_RWLOCK_UNLOCK(&this->lock);
-		free(d);
 		return NULL;
 	}
 
 	/*
 	 * Prepare the table to be sorted.
 	 */
-	int i = 0;
 
 	struct hash_iterator hi;
 	struct element *e;
 	HASH_FOREACH(e, this->key_val, hi) {
 		np = (struct sourceline *)e->value;
 		// printf("%d: %s pos (%f, %f)\n", i, np->key, np->pos.lat, np->pos.lon);
-		if (!np->virtual) {
-			dist_array[i].dist = distance(&np->pos, pos);
-			dist_array[i].pos = np->pos;
-			dist_array[i].mountpoint = np->key;
-			dist_array[i].on_demand = np->on_demand;
-			i++;
-		}
+		if (!np->virtual)
+			dist_table_add(d, distance(&np->pos, pos), &np->pos, np->key, np->on_demand);
 	}
 
 	P_RWLOCK_UNLOCK(&this->lock);
 
 	/*
 	 * Keep some useful additional info
-	 *
-	 * Use i instead of n as the table size, in case they differ.
 	 */
-	d->dist_array = dist_array;
-	d->size_dist_array = i;
 	d->pos = *pos;
-	d->sourcetable = this;
 
 	/*
 	 * Sort the distance array
+	 * Use i instead of n as the table size, in case they differ.
 	 */
-	qsort(dist_array, i, sizeof(struct spos), _cmp_dist);
+	qsort(d->dist_array, d->size_dist_array, sizeof(struct spos), _cmp_dist);
 	return d;
 }
 
@@ -458,13 +463,14 @@ struct sourceline *sourcetable_find_mountpoint(struct sourcetable *this, char *m
 
 void dist_table_free(struct dist_table *this) {
 	free(this->dist_array);
+	strfree((char *)this->host);
 	free(this);
 }
 
 void dist_table_display(struct ntrip_state *st, struct dist_table *this, int max) {
 	float max_dist = this->size_dist_array ? this->dist_array[this->size_dist_array-1].dist : 40000;
 
-	ntrip_log(st, LOG_INFO, "dist_table from (%f, %f) %s:%d, furthest base dist %.2f:", this->pos.lat, this->pos.lon, this->sourcetable->caster, this->sourcetable->port, max_dist);
+	ntrip_log(st, LOG_INFO, "dist_table from (%f, %f) %s:%d, furthest base dist %.2f:", this->pos.lat, this->pos.lon, this->host, this->port, max_dist);
 	for (int i = 0; i < max && i < this->size_dist_array; i++) {
 		ntrip_log(st, LOG_INFO, "%.2f: %s", this->dist_array[i].dist, this->dist_array[i].mountpoint);
 	}
@@ -484,7 +490,6 @@ static struct sourceline *_stack_find_mountpoint(struct caster_state *caster, so
 
 	struct sourceline *r = NULL;
 	struct sourcetable *s;
-	int priority = -10000;
 
 	P_RWLOCK_RDLOCK(&stack->lock);
 
@@ -492,15 +497,15 @@ static struct sourceline *_stack_find_mountpoint(struct caster_state *caster, so
 		if (local && strcmp(s->caster, "LOCAL"))
 			continue;
 		np = sourcetable_find_mountpoint(s, mountpoint);
+		if (!np)
+			continue;
 		/*
 		 * If the mountpoint is from our local table, and other non-local tables are to
-		 * be looked-up, skip if not live.
+		 * be looked-up (local == 0), skip if not live.
 		 */
-		if (!local && np && !strcmp(s->caster, "LOCAL") && (!np->virtual && !livesource_find(caster, NULL, np->key, &np->pos)))
-			continue;
-		if (np && s->priority > priority) {
-			priority = s->priority;
+		if (local || strcmp(s->caster, "LOCAL") || np->virtual || livesource_find(caster, NULL, np->key, &np->pos)) {
 			r = np;
+			break;
 		}
 	}
 
@@ -581,8 +586,20 @@ static void _stack_replace_host(struct caster_state *caster, sourcetable_stack_t
 			}
 		}
 	}
-	if (new_sourcetable != NULL)
-		TAILQ_INSERT_TAIL(&stack->list, new_sourcetable, next);
+	if (new_sourcetable != NULL) {
+		/*
+		 * Insert at the right place to keep the stack sorted by decreasing priority.
+		 */
+		TAILQ_FOREACH(s, &stack->list, next) {
+			if (new_sourcetable->priority >= s->priority) {
+				TAILQ_INSERT_BEFORE(s, new_sourcetable, next);
+				new_sourcetable = NULL;
+				break;
+			}
+		}
+		if (new_sourcetable)
+			TAILQ_INSERT_TAIL(&stack->list, new_sourcetable, next);
+	}
 
 	P_RWLOCK_UNLOCK(&stack->lock);
 }
@@ -593,8 +610,9 @@ void stack_replace_host(struct caster_state *caster, sourcetable_stack_t *stack,
 
 /*
  * Return an aggregated sourcetable as computed from our sourcetable stack.
+ * If pos is not NULL, prune entries over max_dist of pos.
  */
-struct sourcetable *stack_flatten(struct caster_state *caster, sourcetable_stack_t *this) {
+struct sourcetable *stack_flatten_dist(struct caster_state *caster, sourcetable_stack_t *this, pos_t *pos, float max_dist) {
 	struct sourcetable *s;
 	char *header = mystrdup("");
 	struct hash_iterator hi;
@@ -643,31 +661,20 @@ struct sourcetable *stack_flatten(struct caster_state *caster, sourcetable_stack
 			struct element *e = hash_table_get_element(r->key_val, sp->key);
 			struct sourceline *mp;
 
-			if (e) {
-				mp = (struct sourceline *)e->value;
+			if (e == NULL) {
 				/*
-				 * Mountpoint already in table, keep the highest priority entry
+				 * Entry not found, meaning it has the highest priority:
+				 * add it if within maximum distance.
 				 */
-				if (mp->priority < sp->priority) {
+				if (!pos || distance(&sp->pos, pos) < max_dist) {
 					mp = sourceline_copy(sp);
 					if (mp == NULL) {
 						P_RWLOCK_UNLOCK(&s->lock);
 						P_RWLOCK_UNLOCK(&this->lock);
 						goto cancel;
 					}
-					hash_table_replace(r->key_val, e, mp);
+					_sourcetable_add_direct(r, mp);
 				}
-			} else {
-				/*
-				 * Entry not found, add.
-				 */
-				mp = sourceline_copy(sp);
-				if (mp == NULL) {
-					P_RWLOCK_UNLOCK(&s->lock);
-					P_RWLOCK_UNLOCK(&this->lock);
-					goto cancel;
-				}
-				_sourcetable_add_direct(r, mp);
 			}
 		}
 
@@ -681,6 +688,13 @@ cancel:
 	strfree(header);
 	if (r) sourcetable_free(r);
 	return NULL;
+}
+
+/*
+ * Return an aggregated sourcetable as computed from our sourcetable stack
+ */
+struct sourcetable *stack_flatten(struct caster_state *caster, sourcetable_stack_t *this) {
+	return stack_flatten_dist(caster, this, NULL, 0);
 }
 
 /*

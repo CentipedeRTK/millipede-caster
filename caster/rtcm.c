@@ -135,7 +135,7 @@ static void ecef_to_lat_lon(pos_t *pos, double *palt, long ecef_x, long ecef_y, 
  * Extract a bit field in a RTCM packet.
  * beg and len are counted in bits.
  */
-static inline long getbits(unsigned char *d, int beg, int len) {
+uint64_t getbits(unsigned char *d, int beg, int len) {
 	long r;
 	unsigned char mask;
 
@@ -152,7 +152,7 @@ static inline long getbits(unsigned char *d, int beg, int len) {
 	r = d[offset_first] & mask;
 
 	if (offset_first == offset_last)
-		return r >> (8-beg-len);
+		return r >> ((-beg-len) & 7);
 
 	int offset = offset_first+1;
 
@@ -166,11 +166,9 @@ static inline long getbits(unsigned char *d, int beg, int len) {
 	return r;
 }
 
-/*
- * Get and return a int38 as a long
- */
-static inline long get_int38(unsigned char *d, int beg, int len) {
-	long r = getbits(d, beg, len);
+/* Get a int38 as a uint64_t */
+static inline uint64_t get_int38(unsigned char *d, int beg) {
+	uint64_t r = getbits(d, beg, 38);
 	if (r & (1L<<37)) r |= 0xffffffc000000000;
 	return r;
 }
@@ -180,11 +178,11 @@ static inline long get_int38(unsigned char *d, int beg, int len) {
  */
 static void handle_1005_1006(struct ntrip_state *st, struct rtcm_info *rp, int type, unsigned char *d, int len) {
 	unsigned char *data = d+3;
-	long ecef_x, ecef_y, ecef_z;
+	uint64_t ecef_x, ecef_y, ecef_z;
 
-	ecef_x = get_int38(data, 34, 38);
-	ecef_y = get_int38(data, 74, 38);
-	ecef_z = get_int38(data, 114, 38);
+	ecef_x = get_int38(data, 34);
+	ecef_y = get_int38(data, 74);
+	ecef_z = get_int38(data, 114);
 
 	if (type == 1005) {
 		gettimeofday(&rp->posdate, NULL);
@@ -341,25 +339,21 @@ int rtcm_packet_handle(struct ntrip_state *st) {
 		 */
 		evbuffer_ptr_set(input, &p, 0, EVBUFFER_PTR_SET);
 		p = evbuffer_search(input, "\xd3", 1, &p);
-		if (p.pos < 0) {
-			unsigned long len = evbuffer_get_length(input);
-			if (len) {
-				struct packet *not_rtcmp = packet_new(len, st->caster);
-				evbuffer_remove(input, not_rtcmp->data, len);
-				st->received_bytes += len;
-				ntrip_log(st, LOG_INFO, "resending %zd bytes", len);
-				if (livesource_send_subscribers(st->own_livesource, not_rtcmp, st->caster))
-					st->last_send = time(NULL);
-				r = 1;
-				packet_free(not_rtcmp);
-				continue;
-			}
+		int max_len = evbuffer_get_length(input);
+		int len = p.pos < 0 ? max_len : p.pos;
+		if (len) {
+			struct packet *not_rtcmp = packet_new(len, st->caster);
+			evbuffer_remove(input, not_rtcmp->data, len);
+			st->received_bytes += len;
+			ntrip_log(st, LOG_INFO, "resending %zd bytes", len);
+			if (livesource_send_subscribers(st->own_livesource, not_rtcmp, st->caster))
+				st->last_send = time(NULL);
+			r = 1;
+			packet_free(not_rtcmp);
+			max_len -= len;
+		}
+		if (max_len == 0)
 			return r;
-		}
-		if (p.pos > 0) {
-			ntrip_log(st, LOG_DEBUG, "RTCM: found packet start, draining %zd bytes", p.pos);
-			evbuffer_drain(input, p.pos);
-		}
 
 		unsigned char *mem = evbuffer_pullup(input, 3);
 		if (mem == NULL) {
@@ -371,7 +365,7 @@ int rtcm_packet_handle(struct ntrip_state *st) {
 		 * Compute RTCM length from packet header
 		 */
 		len_rtcm = (mem[1] & 3)*256 + mem[2] + 6;
-		if (len_rtcm > evbuffer_get_length(input)) {
+		if (len_rtcm > max_len) {
 			return r;
 		}
 

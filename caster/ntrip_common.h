@@ -29,6 +29,7 @@ enum ntrip_session_state {
 	NTRIP_WAIT_CLIENT_INPUT,	// Server waiting for GGA lines from client
 	NTRIP_WAIT_CLIENT_CONTENT,	// Server waiting for content
 	NTRIP_WAIT_SERVER_CONTENT,	// Client waiting for content
+	NTRIP_WAIT_CHUNKED_CONTENT,	// Client waiting for content with chunked encoding
 	NTRIP_WAIT_CLOSE,		// End of connection, drain output then close
 	NTRIP_FORCE_CLOSE,		// End of connection, force close now
 	NTRIP_IDLE_CLIENT,		// client connection, waiting for something to send
@@ -212,6 +213,7 @@ struct ntrip_state {
 	pos_t last_pos;				// last known position
 	float last_dist;			// last known base distance (for hysteresis)
 	float max_min_dist;			// maximum distance to the closest base
+	float lookup_dist;			// dynamic lookup distance for the nearest base
 	// date and position last used for recomputing the nearest base
 	struct timeval last_recompute_date;
 	pos_t last_recompute_pos;

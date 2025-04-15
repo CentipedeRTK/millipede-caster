@@ -28,6 +28,8 @@ int backlog_delay = 60;
 
 static struct config default_config = {
 	.hysteresis_m = 500,
+	.max_nearest_lookup_distance_m = 1000000,
+	.nearest_base_count_target = 10,
 	.min_nearest_recompute_interval = 10,
 	.max_nearest_recompute_interval = 120,
 	.min_nearest_recompute_pos_delta = 10,
@@ -76,7 +78,8 @@ static struct config_proxy default_config_proxy = {
 static struct config_node default_config_node = {
 	.port = 2443,
 	.tls = 0,
-	.queue_max_size = 4000000
+	.queue_max_size = 4000000,
+	.retry_delay = 30
 };
 
 static struct config_endpoint default_config_endpoint = {
@@ -160,6 +163,8 @@ static const cyaml_schema_field_t node_fields_schema[] = {
 		"tls", CYAML_FLAG_OPTIONAL, struct config_node, tls),
 	CYAML_FIELD_STRING_PTR(
 		"authorization", CYAML_FLAG_POINTER, struct config_node, authorization, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_INT(
+		"retry_delay", CYAML_FLAG_OPTIONAL, struct config_node, retry_delay),
 	CYAML_FIELD_END
 };
 
@@ -245,6 +250,10 @@ static const cyaml_schema_field_t top_mapping_schema[] = {
 		struct config, bind, &bind_schema, 0, CYAML_UNLIMITED),
 	CYAML_FIELD_FLOAT(
 		"hysteresis_m", CYAML_FLAG_DEFAULT|CYAML_FLAG_OPTIONAL, struct config, hysteresis_m),
+	CYAML_FIELD_FLOAT(
+		"max_nearest_lookup_distance_m", CYAML_FLAG_DEFAULT|CYAML_FLAG_OPTIONAL, struct config, max_nearest_lookup_distance_m),
+	CYAML_FIELD_INT(
+		"nearest_base_count_target", CYAML_FLAG_DEFAULT|CYAML_FLAG_OPTIONAL, struct config, nearest_base_count_target),
 	CYAML_FIELD_SEQUENCE(
 		"proxy", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL,
 		struct config, proxy, &proxy_schema, 0, CYAML_UNLIMITED),
@@ -275,6 +284,8 @@ static const cyaml_schema_field_t top_mapping_schema[] = {
 		"sourcetable_fetch_timeout", CYAML_FLAG_OPTIONAL, struct config, sourcetable_fetch_timeout),
 	CYAML_FIELD_INT(
 		"on_demand_source_timeout", CYAML_FLAG_OPTIONAL, struct config, on_demand_source_timeout),
+	CYAML_FIELD_INT(
+		"idle_max_delay", CYAML_FLAG_OPTIONAL, struct config, idle_max_delay),
 	CYAML_FIELD_INT(
 		"source_read_timeout", CYAML_FLAG_OPTIONAL, struct config, source_read_timeout),
 	CYAML_FIELD_INT(
@@ -339,6 +350,8 @@ struct config *config_parse(const char *filename) {
 #define	DEFAULT_ASSIGN(this, field)	{if (!(this)->field) {(this)->field = default_config.field;}}
 
 	DEFAULT_ASSIGN(this, hysteresis_m);
+	DEFAULT_ASSIGN(this, max_nearest_lookup_distance_m);
+	DEFAULT_ASSIGN(this, nearest_base_count_target);
 	DEFAULT_ASSIGN(this, min_nearest_recompute_interval);
 	DEFAULT_ASSIGN(this, max_nearest_recompute_interval);
 	DEFAULT_ASSIGN(this, min_nearest_recompute_pos_delta);
@@ -346,6 +359,7 @@ struct config *config_parse(const char *filename) {
 	DEFAULT_ASSIGN(this, reconnect_delay);
 	DEFAULT_ASSIGN(this, max_raw_packet);
 	DEFAULT_ASSIGN(this, on_demand_source_timeout);
+	DEFAULT_ASSIGN(this, idle_max_delay);
 	DEFAULT_ASSIGN(this, source_read_timeout);
 	DEFAULT_ASSIGN(this, backlog_socket);
 	DEFAULT_ASSIGN(this, backlog_evbuffer);
@@ -381,6 +395,8 @@ struct config *config_parse(const char *filename) {
 			this->node[i].port = default_config_node.port;
 		if (this->node[i].queue_max_size == 0)
 			this->node[i].queue_max_size = default_config_node.queue_max_size;
+		if (this->node[i].retry_delay == 0)
+			this->node[i].retry_delay = default_config_node.retry_delay;
 	}
 
 	for (int i = 0; i < this->endpoint_count; i++) {

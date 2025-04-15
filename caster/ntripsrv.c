@@ -248,20 +248,44 @@ void ntripsrv_redo_virtual_pos(struct ntrip_state *st) {
 		&& distance(&st->last_pos, &st->last_recompute_pos) < st->caster->config->min_nearest_recompute_pos_delta)
 		return;
 
-	struct sourcetable *pos_sourcetable = stack_flatten(st->caster, &st->caster->sourcetablestack);
+	struct sourcetable *pos_sourcetable = stack_flatten_dist(st->caster, &st->caster->sourcetablestack, &st->last_pos, st->lookup_dist);
 	if (pos_sourcetable == NULL)
 		return;
 
+	gettimeofday(&t1, NULL);
+	timersub(&t1, &t0, &t1);
+	ntrip_log(st, LOG_EDEBUG, "stack_flatten_dist %.3f ms", t1.tv_sec*1000+t1.tv_usec/1000.);
 
 	struct dist_table *s = sourcetable_find_pos(pos_sourcetable, &st->last_pos);
 	if (s == NULL) {
 		sourcetable_free(pos_sourcetable);
 		return;
 	}
+
+	float last_lookup_dist = st->lookup_dist;
+
+	if (st->caster->config->nearest_base_count_target > 0) {
+		if (s->size_dist_array < st->caster->config->nearest_base_count_target) {
+			st->lookup_dist *= 2;
+			if (st->lookup_dist > st->caster->config->max_nearest_lookup_distance_m)
+				st->lookup_dist = st->caster->config->max_nearest_lookup_distance_m;
+		} else
+			st->lookup_dist = s->dist_array[st->caster->config->nearest_base_count_target-1].dist + 1000;
+	}
+
+	if (s->size_dist_array == 0) {
+		dist_table_free(s);
+		sourcetable_free(pos_sourcetable);
+		return;
+	}
+
 	st->last_recompute_pos = st->last_pos;
 	st->last_recompute_date = t0;
 
-	ntrip_log(st, LOG_DEBUG, "GGAOK pos (%f, %f) list of %d", st->last_pos.lat, st->last_pos.lon, s->size_dist_array);
+	gettimeofday(&t1, NULL);
+	timersub(&t1, &t0, &t1);
+
+	ntrip_log(st, LOG_DEBUG, "GGAOK pos (%f, %f) list of %d lookup dist %.3f km, %.3f ms", st->last_pos.lat, st->last_pos.lon, s->size_dist_array, last_lookup_dist/1000, t1.tv_sec*1000+t1.tv_usec/1000.);
 	dist_table_display(st, s, 10);
 
 	if (s->dist_array[0].dist > st->max_min_dist) {
@@ -320,6 +344,11 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 
 	if (ntrip_filter_run_input(st) < 0)
 		return;
+
+	if (st->chunk_state == CHUNK_END && evbuffer_get_length(st->input) == 0) {
+		st->state = NTRIP_FORCE_CLOSE;
+		err = 1;
+	}
 
 	while (!err && st->state != NTRIP_WAIT_CLOSE && (waiting_len = evbuffer_get_length(st->input)) > 0) {
 		if (st->state == NTRIP_WAIT_HTTP_METHOD) {
@@ -670,6 +699,11 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 				st->state = NTRIP_WAIT_HTTP_METHOD;
 			}
 		} else if (st->state == NTRIP_WAIT_STREAM_SOURCE) {
+			if (st->chunk_state == CHUNK_END) {
+				st->state = NTRIP_FORCE_CLOSE;
+				err = 1;
+				break;
+			}
 			// will increment st->received_bytes itself
 			rtcm_packet_handle(st);
 			break;
@@ -690,7 +724,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 			evbuffer_add_reference(output, "ERROR - Mount Point Taken or Invalid\r\n", 38, NULL, NULL);
 		else if (err == 409 && st->client_version == 1 && method_post_source)
 			evbuffer_add_reference(output, "ERROR - Mount Point Taken or Invalid\r\n", 38, NULL, NULL);
-		else
+		else if (err >= 100)
 			send_server_reply(st, output, err, &opt_headers, NULL, NULL);
 		ntrip_log(st, LOG_EDEBUG, "ntripsrv_readcb err %d", err);
 		st->state = NTRIP_WAIT_CLOSE;
