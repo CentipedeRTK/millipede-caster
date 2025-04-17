@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bitfield.h"
 #include "conf.h"
 #include "ip.h"
 #include "rtcm.h"
@@ -116,8 +117,46 @@ static int gga_test() {
 	return fail;
 }
 
+static int test_setbits() {
+	puts("test_setbits");
+	int fail = 0;
+
+	uint64_t patterns[] = {0xffffffffffffffff, 0xf0f0f0f0f0f0f0f0, 0x5555555555555555, 0xaaaaaaaaaaaaaaaa, 0x5a5a5a5a5a5a5a5a,
+		0x0123456789abcdef, 0xfedcba9876543210, 0x55aa55aa55aa55aa};
+	unsigned char datapattern[16];
+
+	memset(datapattern, 0, sizeof datapattern);
+
+	for (int i = 0; i < sizeof patterns / sizeof(patterns[0]); i++) {
+		uint64_t p = patterns[i];
+		for (int len = 1; len <= 64; len++) {
+			for (int beg = 0; beg <= 64; beg++) {
+				uint64_t r, expect;
+				expect = p >> (64-len);
+				setbits(datapattern, beg, len, expect);
+				r = getbits(datapattern, beg, len);
+				if (r == expect)
+					putchar('.');
+				else {
+					printf("\nFAIL: getbits(data, %d, %d) returned 0x%016lx vs 0x%016lx\n", beg, len, r, expect);
+					fail++;
+				}
+				setbits(datapattern, beg, len, 0x0);
+				r = getbits(datapattern, beg, len);
+				if (r == 0)
+					putchar('.');
+				else {
+					printf("\nFAIL: getbits(data, %d, %d) returned 0x%016lx vs 0\n", beg, len, r);
+					fail++;
+				}
+			}
+		}
+	}
+	return fail;
+}
+
 static int test_getbits() {
-	puts("getbits");
+	puts("test_getbits");
 	int fail = 0;
 
 	unsigned char data[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
@@ -189,6 +228,63 @@ static int test_getbits() {
 			}
 		}
 	}
+	return fail;
+}
+
+static int test_rtcm_typeset_parse() {
+	puts("test_rtcm_typeset_parse");
+	struct rtcm_typeset tmp;
+	int fail = 0;
+
+	struct test {
+		const char *parse, *expect;
+	};
+
+	struct test testlist[] = {
+		{"", ""},
+		{"0", NULL},
+		{"-1", NULL},
+		{"999", NULL},
+		{"99999", NULL},
+		{"1231", NULL},
+		{"3999", NULL},
+		{"4096", NULL},
+		{",", NULL},
+		{"1000,", NULL},
+		{"999,1000", NULL},
+		{"1000,999", NULL},
+		{"1000", "1000"},
+		{"1020", "1020"},
+		{"4000", "4000"},
+		{"4095", "4095"},
+		{"1020,1010", "1010,1020"},
+		{"1230", "1230"},
+		{NULL, NULL}
+	};
+	for (struct test *tl = testlist; tl->parse; tl++) {
+		int r = rtcm_typeset_parse(&tmp, tl->parse);
+		if (r < 0) {
+			if (tl->expect == NULL)
+				putchar('.');
+			else {
+				printf("\nFAIL: rtcm_typeset_parse(\"%s\") returned %d instead of %s\n", tl->parse, r, tl->expect);
+				fail++;
+			}
+		} else if (r >= 0 && tl->expect == NULL) {
+			printf("\nFAIL: rtcm_typeset_parse(\"%s\") returned %d instead of -1\n", tl->parse, r);
+			fail++;
+		} else {
+			char *rstr = rtcm_typeset_str(&tmp);
+			if (!strcmp(rstr, tl->expect))
+				putchar('.');
+			else {
+				printf("\nFAIL: rtcm_typeset_str(rtcm_typeset_parse(\"%s\")) returned %s instead of \"%s\"\n", tl->parse, rstr, tl->expect);
+				fail++;
+			}
+			free(rstr);
+		}
+	}
+	putchar('\n');
 	return fail;
 }
 
@@ -314,5 +410,7 @@ int main() {
 	fail += test_ip_analyze_prefixquota();
 	fail += urldecode_test();
 	fail += test_getbits();
+	fail += test_setbits();
+	fail += test_rtcm_typeset_parse();
 	return fail != 0;
 }

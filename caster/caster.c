@@ -51,7 +51,6 @@
 
 static void caster_log_cb(void *arg, struct gelf_entry *g, int level, const char *fmt, va_list ap);
 static void caster_alog(void *arg, struct gelf_entry *g, int level, const char *fmt, va_list ap);
-static int caster_start_fetchers(struct caster_state *this);
 static int caster_reload_fetchers(struct caster_state *this);
 static void caster_free_fetchers(struct caster_state *this);
 static void listener_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *sa, int socklen, void *arg);
@@ -191,7 +190,7 @@ json_object *caster_endpoints_json(struct caster_state *caster) {
 }
 
 static struct caster_state *
-caster_new(struct config *config, const char *config_file) {
+caster_new(const char *config_file) {
 	int err = 0;
 	struct caster_state *this = (struct caster_state *)calloc(1, sizeof(struct caster_state));
 	if (this == NULL)
@@ -245,8 +244,8 @@ caster_new(struct config *config, const char *config_file) {
 
 	P_RWLOCK_INIT(&this->sourcetablestack.lock, NULL);
 
-	this->config = config;
-	this->endpoints_json = caster_endpoints_json(this);
+	this->config = NULL;
+	this->endpoints_json = NULL;
 	this->config_file = config_file;
 
 	char *abs_config_path = realpath(config_file, NULL);
@@ -270,13 +269,16 @@ caster_new(struct config *config, const char *config_file) {
 	if (this->config_dir) chdir(this->config_dir);
 
 	this->joblist = threads ? joblist_new(this) : NULL;
-	int r1 = log_init(&this->flog, this->config->log, &caster_log_cb, this);
-	int r2 = log_init(&this->alog, this->config->access_log, &caster_alog, this);
+
+	int r1 = log_init(&this->flog, NULL, &caster_log_cb, this);
+	int r2 = log_init(&this->alog, NULL, &caster_alog, this);
 
 	this->graylog = NULL;
 	this->graylog_count = 0;
 	this->syncers = NULL;
 	this->syncers_count = 0;
+	this->rtcm_filter = NULL;
+	this->rtcm_filter_dict = NULL;
 
 	fchdir(current_dir);
 	close(current_dir);
@@ -323,27 +325,6 @@ static void caster_free_listeners(struct caster_state *this) {
 	this->listeners_count = 0;
 }
 
-static int caster_start_graylog(struct caster_state *this) {
-	if (this->config->graylog_count != 1)
-		return 0;
-	this->graylog = (struct graylog_sender **)malloc(sizeof(struct graylog_sender *)*this->config->graylog_count);
-	this->graylog_count = this->config->graylog_count;
-	for (int i = 0; i < this->config->graylog_count; i++) {
-		this->graylog[i] = graylog_sender_new(this,
-			this->config->graylog[i].host,
-			this->config->graylog[i].port,
-			this->config->graylog[i].uri,
-			this->config->graylog[i].tls,
-			this->config->graylog[i].retry_delay,
-			this->config->graylog[i].bulk_max_size,
-			this->config->graylog[i].queue_max_size,
-			this->config->graylog[i].authorization,
-			this->config->graylog[i].drainfilename);
-		graylog_sender_start(this->graylog[i], 0);
-	}
-	return 0;
-}
-
 static int caster_start_syncers(struct caster_state *this) {
 	if (this->config->node_count == 0) {
 		this->syncers_count = 0;
@@ -384,9 +365,21 @@ static void caster_free_graylog(struct caster_state *this) {
 }
 
 static int caster_reload_graylog(struct caster_state *this) {
-	if (this->graylog_count == 1 && this->config->graylog_count == 1) {
-		int i = 0;
-		return graylog_sender_reload(this->graylog[i],
+	int r = 0;
+	int i;
+
+	/* The log system is currently hardocoded for graylog_count == 0 or 1 */
+
+	struct graylog_sender **new_graylog = NULL;
+
+	if (this->config->graylog_count) {
+		new_graylog = (struct graylog_sender **)malloc(sizeof(struct graylog_sender *)*this->config->graylog_count);
+		if (new_graylog == NULL)
+			return -1;
+	}
+
+	for (i = 0; i < this->config->graylog_count; i++) {
+		new_graylog[i] = graylog_sender_new(this,
 			this->config->graylog[i].host,
 			this->config->graylog[i].port,
 			this->config->graylog[i].uri,
@@ -396,10 +389,22 @@ static int caster_reload_graylog(struct caster_state *this) {
 			this->config->graylog[i].queue_max_size,
 			this->config->graylog[i].authorization,
 			this->config->graylog[i].drainfilename);
+		if (!new_graylog[i]) {
+			r = -1;
+			break;
+		}
+		graylog_sender_start(new_graylog[i], 0);
+	}
+	if (r == -1) {
+		for (int j = 0; i < j; j++)
+			graylog_sender_free(new_graylog[j]);
+		free(new_graylog);
 	} else {
 		caster_free_graylog(this);
-		return caster_start_graylog(this);
+		this->graylog = new_graylog;
+		this->graylog_count = this->config->graylog_count;
 	}
+	return r;
 }
 
 void caster_free(struct caster_state *this) {
@@ -450,8 +455,10 @@ void caster_free(struct caster_state *this) {
 	log_free(&this->flog);
 	log_free(&this->alog);
 	strfree(this->config_dir);
-	json_object_put(this->endpoints_json);
-	config_free(this->config);
+	if (this->endpoints_json)
+		json_object_put(this->endpoints_json);
+	if (this->config)
+		config_free(this->config);
 	libevent_global_shutdown();
 	free(this);
 }
@@ -459,7 +466,7 @@ void caster_free(struct caster_state *this) {
 /*
  * Load TLS certificates from file paths.
  */
-static int listener_load_certs(struct listener *this, char *tls_full_certificate_chain, char *tls_private_key) {
+static int listener_load_certs(struct listener *this, const char *tls_full_certificate_chain, const char *tls_private_key) {
 	if (SSL_CTX_use_certificate_chain_file(this->ssl_server_ctx, tls_full_certificate_chain) <= 0)
 		return -1;
 	if (SSL_CTX_use_PrivateKey_file(this->ssl_server_ctx, tls_private_key, SSL_FILETYPE_PEM) <= 0)
@@ -537,7 +544,7 @@ static int caster_start_listener(struct caster_state *this, struct config_bind *
 }
 
 /*
- * Reconfigure listening ports, reusing already existing sockets if possible.
+ * Configure/reconfigure listening ports, reusing already existing sockets if possible.
  */
 static int caster_reload_listeners(struct caster_state *this) {
 	union sock sin;
@@ -744,13 +751,64 @@ caster_reload_blocklist(struct caster_state *caster) {
 	return r;
 }
 
+static void
+caster_free_rtcm_filters(struct caster_state *caster) {
+	if (caster->rtcm_filter_dict) {
+		hash_table_free(caster->rtcm_filter_dict);
+		caster->rtcm_filter_dict = NULL;
+	}
+	if (caster->rtcm_filter)
+		rtcm_filter_free(caster->rtcm_filter);
+	caster->rtcm_filter = NULL;
+}
+
+static int
+caster_reload_rtcm_filters(struct caster_state *caster) {
+	//P_RWLOCK_WRLOCK(&caster->configlock);
+	if (caster->config->rtcm_filter_count == 0) {
+		caster_free_rtcm_filters(caster);
+		return 0;
+	}
+	if (caster->config->rtcm_filter_count != 1) {
+		caster_free_rtcm_filters(caster);
+		return -1;
+	}
+
+	caster->rtcm_filter_dict = hash_table_new(5, NULL);
+	if (caster->rtcm_filter_dict == NULL)
+		return -1;
+
+	for (int i = 0; i < caster->config->rtcm_filter_count; i++) {
+		struct rtcm_filter *rtcm_filter;
+		rtcm_filter = rtcm_filter_new(
+			caster->config->rtcm_filter[i].pass,
+			caster->config->rtcm_filter[i].convert_count ? caster->config->rtcm_filter[i].convert[0].types : NULL,
+			caster->config->rtcm_filter[i].convert_count ? caster->config->rtcm_filter[i].convert[0].conversion : 0
+		);
+		if (rtcm_filter == NULL) {
+			logfmt(&caster->flog, LOG_ERR, "Can't parse rtcm_filter configuration from %s", caster->config_file);
+			return -1;
+		}
+		struct hash_table *h = rtcm_filter_dict_parse(rtcm_filter, caster->config->rtcm_filter[i].apply);
+		if (h == NULL) {
+			logfmt(&caster->flog, LOG_ERR, "Can't parse rtcm_filter configuration from %s", caster->config_file);
+			rtcm_filter_free(rtcm_filter);
+			return -1;
+		}
+		hash_table_update(caster->rtcm_filter_dict, h);
+		caster->rtcm_filter = rtcm_filter;
+	}
+	return 0;
+}
+
 static int caster_reload_config(struct caster_state *this) {
 	struct config *config;
 	if (!(config = config_parse(this->config_file))) {
 		logfmt(&this->flog, LOG_ERR, "Can't parse configuration from %s", this->config_file);
 		return -1;
 	}
-	config_free(this->config);
+	if (this->config)
+		config_free(this->config);
 	this->config = config;
 	json_object_put(this->endpoints_json);
 	this->endpoints_json = caster_endpoints_json(this);
@@ -771,6 +829,8 @@ static int caster_chdir_reload(struct caster_state *this, int reopen_logs) {
 	if (caster_reload_auth(this) < 0)
 		r = -1;
 	if (caster_reload_blocklist(this) < 0)
+		r = -1;
+	if (caster_reload_rtcm_filters(this) < 0)
 		r = -1;
 	fchdir(current_dir);
 	close(current_dir);
@@ -864,6 +924,8 @@ int caster_reload(struct caster_state *this) {
 	int r = 0;
 	if (caster_reload_config(this) < 0)
 		r = -1;
+	if (caster_chdir_reload(this, 1) < 0)
+		r = -1;
 	if (caster_reload_listeners(this) < 0)
 		r = -1;
 	if (caster_reload_fetchers(this) < 0)
@@ -871,8 +933,6 @@ int caster_reload(struct caster_state *this) {
 	if (caster_reload_graylog(this) < 0)
 		r = -1;
 	if (caster_reload_syncers(this) < 0)
-		r = -1;
-	if (caster_chdir_reload(this, 1) < 0)
 		r = -1;
 	return r;
 }
@@ -912,38 +972,15 @@ static int caster_set_signals(struct caster_state *this) {
 }
 
 /*
- * Start sourcetable fetchers (proxy)
+ * Start/reload sourcetable fetchers (proxy)
  */
-static int caster_start_fetchers(struct caster_state *this) {
-	if (!this->config->proxy_count)
-		return 0;
-
-	struct sourcetable_fetch_args **fetchers = (struct sourcetable_fetch_args **)malloc(sizeof(struct sourcetable_fetch_args *)*this->config->proxy_count);
-
-	this->sourcetable_fetchers = fetchers;
-	this->sourcetable_fetchers_count = this->config->proxy_count;
-
-	for (int i = 0; i < this->sourcetable_fetchers_count; i++) {
-		fetchers[i] = fetcher_sourcetable_new(this,
-			this->config->proxy[i].host,
-			this->config->proxy[i].port,
-			this->config->proxy[i].tls,
-			this->config->proxy[i].table_refresh_delay,
-			this->config->proxy[i].priority);
-		if (fetchers[i])
-			fetcher_sourcetable_start(fetchers[i], 0);
-	}
-
-	return 0;
-}
-
 static int caster_reload_fetchers(struct caster_state *this) {
 	int r = 0;
-	if (!this->config->proxy_count) {
-		caster_free_fetchers(this);
-		return 0;
-	}
-	struct sourcetable_fetch_args **new_fetchers = (struct sourcetable_fetch_args **)malloc(sizeof(struct sourcetable_fetch_args *)*this->config->proxy_count);
+	struct sourcetable_fetch_args **new_fetchers;
+	if (this->config->proxy_count)
+		new_fetchers = (struct sourcetable_fetch_args **)malloc(sizeof(struct sourcetable_fetch_args *)*this->config->proxy_count);
+	else
+		new_fetchers = NULL;
 
 	/*
 	 * For each entry in the new config, recycle a similar entry in the old configuration.
@@ -1024,22 +1061,13 @@ int caster_main(char *config_file) {
 		return 1;
 	}
 
-	struct config *config = config_parse(config_file);
-
-	if (!config) {
-		fprintf(stderr, "Can't parse configuration from %s\n", config_file);
-		return 1;
-	}
-
-	caster = caster_new(config, config_file);
+	caster = caster_new(config_file);
 	if (!caster) {
 		fprintf(stderr, "Can't allocate caster\n");
 		return 1;
 	}
 
-	caster_chdir_reload(caster, 0);
-
-	if (caster_reload_listeners(caster) < 0) {
+	if (caster_reload(caster) < 0) {
 		caster_free(caster);
 		return 1;
 	}
@@ -1054,10 +1082,6 @@ int caster_main(char *config_file) {
 		caster_free(caster);
 		return 1;
 	}
-
-	caster_start_fetchers(caster);
-	caster_start_graylog(caster);
-	caster_start_syncers(caster);
 
 	event_base_dispatch(caster->base);
 

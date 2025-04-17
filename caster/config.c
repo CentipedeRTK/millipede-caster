@@ -112,6 +112,14 @@ static const cyaml_strval_t log_level_strings[] = {
 	{ "EDEBUG", LOG_EDEBUG },
 };
 
+/*
+ * YAML mapping from RTCM conversion name to integer values
+ */
+static const cyaml_strval_t rtcm_conversion_strings[] = {
+	{ "msm7_3", RTCM_CONV_MSM7_3 },
+	{ "msm7_4", RTCM_CONV_MSM7_4 }
+};
+
 static const cyaml_schema_field_t bind_fields_schema[] = {
 	CYAML_FIELD_STRING_PTR(
 		"ip", CYAML_FLAG_POINTER, struct config_bind, ip, 0, CYAML_UNLIMITED),
@@ -243,6 +251,37 @@ static const cyaml_schema_value_t webroots_schema = {
 		struct config_webroots, webroots_fields_schema),
 };
 
+static const cyaml_schema_field_t rtcm_convert_fields_schema[] = {
+	CYAML_FIELD_STRING_PTR(
+		"types", CYAML_FLAG_POINTER, struct config_rtcm_convert, types, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_ENUM(
+			"conversion", CYAML_FLAG_DEFAULT, struct config_rtcm_convert,
+			conversion, rtcm_conversion_strings,
+			CYAML_ARRAY_LEN(rtcm_conversion_strings)),
+	CYAML_FIELD_END
+};
+
+static const cyaml_schema_value_t rtcm_convert_schema = {
+	CYAML_VALUE_MAPPING(CYAML_FLAG_DEFAULT,
+		struct config_rtcm_convert, rtcm_convert_fields_schema),
+};
+
+static const cyaml_schema_field_t rtcm_filter_fields_schema[] = {
+	CYAML_FIELD_STRING_PTR(
+		"apply", CYAML_FLAG_POINTER, struct config_rtcm_filter, apply, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_STRING_PTR(
+		"pass", CYAML_FLAG_POINTER, struct config_rtcm_filter, pass, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_SEQUENCE(
+		"convert", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL,
+		struct config_rtcm_filter, convert, &rtcm_convert_schema, 0, 1),
+	CYAML_FIELD_END
+};
+
+static const cyaml_schema_value_t rtcm_filter_schema = {
+	CYAML_VALUE_MAPPING(CYAML_FLAG_DEFAULT,
+		struct config_rtcm_filter, rtcm_filter_fields_schema),
+};
+
 /* CYAML mapping schema fields array for the top level mapping. */
 static const cyaml_schema_field_t top_mapping_schema[] = {
 	CYAML_FIELD_SEQUENCE(
@@ -318,6 +357,9 @@ static const cyaml_schema_field_t top_mapping_schema[] = {
 		struct config, webroots, &webroots_schema, 0, CYAML_UNLIMITED),
 	CYAML_FIELD_STRING_PTR(
 		"syncer_auth", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL, struct config, syncer_auth, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_SEQUENCE(
+		"rtcm_filter", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL,
+		struct config, rtcm_filter, &rtcm_filter_schema, 0, 1),
 	CYAML_FIELD_END
 };
 
@@ -347,7 +389,8 @@ struct config *config_parse(const char *filename) {
 		return NULL;
 	}
 
-#define	DEFAULT_ASSIGN(this, field)	{if (!(this)->field) {(this)->field = default_config.field;}}
+#define	DEFAULT_ASSIGN(this, field)		{if (!(this)->field) {(this)->field = default_config.field;}}
+#define	DEFAULT_ASSIGN_ARRAY(this, i, struct1, struct2, field)	{if (!(this)->struct1[i].field) {(this)->struct1[i].field = struct2.field;}}
 
 	DEFAULT_ASSIGN(this, hysteresis_m);
 	DEFAULT_ASSIGN(this, max_nearest_lookup_distance_m);
@@ -382,44 +425,31 @@ struct config *config_parse(const char *filename) {
 	this->zero_copy = !this->disable_zero_copy;
 
 	for (int i = 0; i < this->proxy_count; i++) {
-		if (this->proxy[i].table_refresh_delay == 0)
-			this->proxy[i].table_refresh_delay = default_config_proxy.table_refresh_delay;
-		if (this->proxy[i].port == 0)
-			this->proxy[i].port = default_config_proxy.port;
-		if (this->proxy[i].priority == 0)
-			this->proxy[i].priority = default_config_proxy.priority;
+		DEFAULT_ASSIGN_ARRAY(this, i, proxy, default_config_proxy, table_refresh_delay);
+		DEFAULT_ASSIGN_ARRAY(this, i, proxy, default_config_proxy, port);
+		DEFAULT_ASSIGN_ARRAY(this, i, proxy, default_config_proxy, priority);
 	}
 
 	for (int i = 0; i < this->node_count; i++) {
-		if (this->node[i].port == 0)
-			this->node[i].port = default_config_node.port;
-		if (this->node[i].queue_max_size == 0)
-			this->node[i].queue_max_size = default_config_node.queue_max_size;
-		if (this->node[i].retry_delay == 0)
-			this->node[i].retry_delay = default_config_node.retry_delay;
+		DEFAULT_ASSIGN_ARRAY(this, i, node, default_config_node, port);
+		DEFAULT_ASSIGN_ARRAY(this, i, node, default_config_node, queue_max_size);
+		DEFAULT_ASSIGN_ARRAY(this, i, node, default_config_node, retry_delay);
 	}
 
 	for (int i = 0; i < this->endpoint_count; i++) {
-		if (this->endpoint[i].port == 0)
-			this->endpoint[i].port = default_config_endpoint.port;
+		DEFAULT_ASSIGN_ARRAY(this, i, endpoint, default_config_endpoint, port);
 	}
 
 	for (int i = 0; i < this->graylog_count; i++) {
-		if (this->graylog[i].retry_delay == 0)
-			this->graylog[i].retry_delay = default_config_graylog.retry_delay;
-		if (this->graylog[i].port == 0)
-			this->graylog[i].port = default_config_graylog.port;
-		if (this->graylog[i].bulk_max_size == 0)
-			this->graylog[i].bulk_max_size = default_config_graylog.bulk_max_size;
-		if (this->graylog[i].queue_max_size == 0)
-			this->graylog[i].queue_max_size = default_config_graylog.queue_max_size;
+		DEFAULT_ASSIGN_ARRAY(this, i, graylog, default_config_graylog, retry_delay);
+		DEFAULT_ASSIGN_ARRAY(this, i, graylog, default_config_graylog, port);
+		DEFAULT_ASSIGN_ARRAY(this, i, graylog, default_config_graylog, bulk_max_size);
+		DEFAULT_ASSIGN_ARRAY(this, i, graylog, default_config_graylog, queue_max_size);
 	}
 
 	for (int i = 0; i < this->bind_count; i++) {
-		if (this->bind[i].port == 0)
-			this->bind[i].port = default_config_bind.port;
-		if (this->bind[i].queue_size == 0)
-			this->bind[i].queue_size = default_config_bind.queue_size;
+		DEFAULT_ASSIGN_ARRAY(this, i, bind, default_config_bind, port);
+		DEFAULT_ASSIGN_ARRAY(this, i, bind, default_config_bind, queue_size);
 	}
 
 	if (this->threads_count == 0) {
@@ -445,13 +475,44 @@ struct config *config_parse(const char *filename) {
  * cyaml_free() crashes if we let it do the job, possibly because of structure field order.
  */
 void config_free(struct config *this) {
-	for (int i = 0; i < this->bind_count; i++)
-		free(this->bind[i].ip);
+	for (int i = 0; i < this->bind_count; i++) {
+		free((char *)this->bind[i].ip);
+		free((char *)this->bind[i].hostname);
+		free((char *)this->bind[i].tls_full_certificate_chain);
+		free((char *)this->bind[i].tls_private_key);
+	}
 	free(this->bind);
 
 	for (int i = 0; i < this->proxy_count; i++)
-		free(this->proxy[i].host);
+		free((char *)this->proxy[i].host);
 	free(this->proxy);
+
+	for (int i = 0; i < this->webroots_count; i++) {
+		free((char *)this->webroots[i].path);
+		free((char *)this->webroots[i].uri);
+	}
+	free(this->webroots);
+
+	for (int i = 0; i < this->node_count; i++) {
+		free((char *)this->node[i].host);
+		free((char *)this->node[i].authorization);
+	}
+	free(this->node);
+
+	for (int i = 0; i < this->endpoint_count; i++) {
+		free((char *)this->endpoint[i].ip);
+		free((char *)this->endpoint[i].host);
+	}
+	free(this->endpoint);
+
+	for (int i = 0; i < this->graylog_count; i++) {
+		free((char *)this->graylog[i].host);
+		free((char *)this->graylog[i].uri);
+		free((char *)this->graylog[i].authorization);
+		free((char *)this->graylog[i].drainfilename);
+	}
+	free(this->graylog);
+
 	free(this->threads);
 
 	free((char *)this->host_auth_filename);
