@@ -1,9 +1,13 @@
 #include <string.h>
+#include <unistd.h>
 
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
+#include <event2/bufferevent_ssl.h>
 #include <event2/event_struct.h>
 #include <event2/http.h>
+
+#include <openssl/err.h>
 
 #include "conf.h"
 #include "ntripsrv.h"
@@ -456,6 +460,13 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 			} else {
 				ntrip_log(st, LOG_EDEBUG, "[End headers]");
 
+				if (st->content_length) {
+					st->content = (char *)strmalloc(st->content_length+1);
+					if (st->content == NULL) {
+						err = 503;
+						break;
+					}
+				}
 				if (st->client_version == 1)
 					st->connection_keepalive = 0;
 				if (st->chunk_state == CHUNK_INIT && ntrip_chunk_decode_init(st) < 0) {
@@ -586,9 +597,8 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					if (!strcmp(st->http_args[0], "POST")) {
 						if (strlen(st->http_args[1]) >= 5 && !memcmp(st->http_args[1], "/adm/", 5)) {
 							st->type = "adm";
-							st->content = (char *)strmalloc(st->content_length+1);
-							if (st->content == NULL && st->content_length) {
-								err = 503;
+							if (!st->content_length) {
+								err = 400;
 								break;
 							}
 							st->state = NTRIP_WAIT_CLIENT_CONTENT;
@@ -817,4 +827,76 @@ void ntripsrv_workers_writecb(struct bufferevent *bev, void *arg) {
 void ntripsrv_workers_eventcb(struct bufferevent *bev, short events, void *arg) {
 	struct ntrip_state *st = (struct ntrip_state *)arg;
 	joblist_append(st->caster->joblist, NULL, ntripsrv_eventcb, bev, arg, events);
+}
+
+void ntripsrv_listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
+    struct sockaddr *sa, int socklen, void *arg)
+{
+	struct listener *listener_conf = arg;
+	struct caster_state *caster = listener_conf->caster;
+	struct event_base *base = caster->base;
+	struct bufferevent *bev;
+	SSL *ssl = NULL;
+
+	//P_RWLOCK_RDLOCK(&listener_conf->caster->configlock);
+	if (listener_conf->tls) {
+		ssl = SSL_new(listener_conf->ssl_server_ctx);
+		if (ssl == NULL) {
+			P_RWLOCK_UNLOCK(&listener_conf->caster->configlock);
+			ERR_print_errors_cb(caster_tls_log_cb, caster);
+			close(fd);
+			return;
+		}
+
+		if (threads)
+			bev = bufferevent_openssl_socket_new(caster->base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
+		else
+			bev = bufferevent_openssl_socket_new(caster->base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE);
+	} else {
+		if (threads)
+			bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
+		else
+			bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+	}
+	//P_RWLOCK_UNLOCK(&listener_conf->caster->configlock);
+
+	if (bev == NULL) {
+		logfmt(&caster->flog, LOG_ERR, "Error constructing bufferevent!");
+		close(fd);
+		return;
+	}
+
+	struct ntrip_state *st = ntrip_new(caster, bev, NULL, 0, NULL, NULL);
+	if (st == NULL) {
+		logfmt(&caster->flog, LOG_ERR, "Error constructing ntrip_state for a new connection!");
+		bufferevent_free(bev);
+		close(fd);
+		return;
+	}
+
+	st->ssl = ssl;
+	st->bev_close_on_free = 1;
+	st->connection_keepalive = 1;
+	ntrip_set_peeraddr(st, sa, socklen);
+	ntrip_set_localaddr(st);
+
+	st->state = NTRIP_WAIT_HTTP_METHOD;
+
+	if (ntrip_register_check(st) < 0) {
+		ntrip_deferred_free(st, "ntripsrv_listener_cb");
+		return;
+	}
+
+	ntrip_log(st, LOG_INFO, "New connection");
+
+	// evbuffer_defer_callbacks(bufferevent_get_output(bev), st->caster->base);
+
+	if (threads)
+		bufferevent_setcb(bev, ntripsrv_workers_readcb, ntripsrv_workers_writecb, ntripsrv_workers_eventcb, st);
+	else
+		bufferevent_setcb(bev, ntripsrv_readcb, ntripsrv_writecb, ntripsrv_eventcb, st);
+	bufferevent_enable(bev, EV_READ|EV_WRITE);
+	struct timeval read_timeout = { st->caster->config->ntripsrv_default_read_timeout, 0 };
+	struct timeval write_timeout = { st->caster->config->ntripsrv_default_write_timeout, 0 };
+	bufferevent_set_timeouts(bev, &read_timeout, &write_timeout);
 }
