@@ -63,7 +63,6 @@ struct dist_table {
 
 struct sourcetable *sourcetable_read(struct caster_state *caster, const char *filename, int priority);
 struct sourcetable *sourcetable_new(const char *host, unsigned short port, int tls);
-void sourcetable_free_unlocked(struct sourcetable *this);
 void sourcetable_free(struct sourcetable *this);
 struct mime_content *sourcetable_get(struct sourcetable *this);
 json_object *sourcetable_json(struct sourcetable *this);
@@ -79,6 +78,7 @@ struct sourceline *stack_find_mountpoint(struct caster_state *caster, sourcetabl
 struct sourceline *stack_find_local_mountpoint(struct caster_state *caster, sourcetable_stack_t *stack, char *mountpoint);
 struct sourceline *stack_find_pullable(sourcetable_stack_t *stack, char *mountpoint, struct sourcetable **sourcetable);
 void stack_replace_host(struct caster_state *caster, sourcetable_stack_t *stack, const char *host, unsigned port, struct sourcetable *new_sourcetable);
+void stack_replace_local(struct caster_state *caster, sourcetable_stack_t *stack, struct sourcetable *new_sourcetable);
 struct sourcetable *stack_flatten_dist(struct caster_state *caster, sourcetable_stack_t *this, pos_t *pos, float max_dist);
 struct sourcetable *stack_flatten(struct caster_state *caster, sourcetable_stack_t *this);
 struct mime_content *sourcetable_list_json(struct caster_state *caster, struct request *req);

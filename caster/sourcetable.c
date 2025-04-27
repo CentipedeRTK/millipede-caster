@@ -13,6 +13,8 @@
 #include "ntrip_common.h"
 #include "sourcetable.h"
 
+static int _sourcetable_add_unlocked(struct sourcetable *this, const char *sourcetable_entry, int on_demand, struct caster_state *caster);
+
 /*
  * Read a sourcetable file
  */
@@ -50,7 +52,7 @@ struct sourcetable *sourcetable_read(struct caster_state *caster, const char *fi
 		if (*p == '#')
 			/* Skip comment line */
 			continue;
-		if (sourcetable_add(tmp_sourcetable, line, 0, caster) < 0) {
+		if (_sourcetable_add_unlocked(tmp_sourcetable, line, 0, caster) < 0) {
 			logfmt(&caster->flog, LOG_ERR, "Can't parse line %d in sourcetable", nlines);
 			strfree(line);
 			sourcetable_free(tmp_sourcetable);
@@ -105,7 +107,7 @@ static struct sourcetable *sourcetable_from_json(json_object *j, struct caster_s
 		struct json_object *source = json_object_iter_peek_value(&it);
 		const char *str = json_object_get_string(json_object_object_get(source, "str"));
 
-		if (str == NULL || sourcetable_add(tmp_sourcetable, str, tmp_sourcetable->pullable, caster) < 0) {
+		if (str == NULL || _sourcetable_add_unlocked(tmp_sourcetable, str, tmp_sourcetable->pullable, caster) < 0) {
 			sourcetable_free(tmp_sourcetable);
 			tmp_sourcetable = NULL;
 			break;
@@ -144,21 +146,15 @@ struct sourcetable *sourcetable_new(const char *host, unsigned short port, int t
 	return this;
 }
 
-void sourcetable_free_unlocked(struct sourcetable *this) {
+void sourcetable_free(struct sourcetable *this) {
 	strfree(this->header);
 	strfree(this->caster);
 	strfree((char *)this->filename);
 
 	hash_table_free(this->key_val);
 
-	P_RWLOCK_UNLOCK(&this->lock);
 	P_RWLOCK_DESTROY(&this->lock);
 	free(this);
-}
-
-void sourcetable_free(struct sourcetable *this) {
-	P_RWLOCK_WRLOCK(&this->lock);
-	sourcetable_free_unlocked(this);
 }
 
 /*
@@ -253,15 +249,13 @@ json_object *sourcetable_json(struct sourcetable *this) {
 
 static int _sourcetable_add_direct(struct sourcetable *this, struct sourceline *s) {
 	int r;
-	P_RWLOCK_WRLOCK(&this->lock);
 	r = hash_table_add(this->key_val, s->key, s);
 	if (s->virtual)
 		this->nvirtual++;
-	P_RWLOCK_UNLOCK(&this->lock);
 	return r;
 }
 
-int sourcetable_add(struct sourcetable *this, const char *sourcetable_entry, int on_demand, struct caster_state *caster) {
+static int _sourcetable_add_unlocked(struct sourcetable *this, const char *sourcetable_entry, int on_demand, struct caster_state *caster) {
 	int r = 0;
 	if (!strncmp(sourcetable_entry, "STR;", 4)) {
 		struct sourceline *n1 = sourceline_new_parse(sourcetable_entry,
@@ -277,19 +271,22 @@ int sourcetable_add(struct sourcetable *this, const char *sourcetable_entry, int
 			sourceline_free(n1);
 		}
 	} else {
-		P_RWLOCK_WRLOCK(&this->lock);
 		int new_len = strlen(this->header) + strlen(sourcetable_entry) + 3;
 		char *s = (char *)strrealloc(this->header, new_len);
-		if (s == NULL) {
-			P_RWLOCK_UNLOCK(&this->lock);
+		if (s == NULL)
 			return -1;
-		}
 		strcat(s, sourcetable_entry);
 		strcat(s, "\r\n");
 		this->header = s;
-		P_RWLOCK_UNLOCK(&this->lock);
 	}
 	return r;
+}
+
+int sourcetable_add(struct sourcetable *this, const char *sourcetable_entry, int on_demand, struct caster_state *caster) {
+	P_RWLOCK_WRLOCK(&this->lock);
+	int result = _sourcetable_add_unlocked(this, sourcetable_entry, on_demand, caster);
+	P_RWLOCK_UNLOCK(&this->lock);
+	return result;
 }
 
 /*
@@ -503,7 +500,7 @@ static struct sourceline *_stack_find_mountpoint(struct caster_state *caster, so
 		 * If the mountpoint is from our local table, and other non-local tables are to
 		 * be looked-up (local == 0), skip if not live.
 		 */
-		if (local || strcmp(s->caster, "LOCAL") || np->virtual || livesource_find(caster, NULL, np->key, &np->pos)) {
+		if (local || strcmp(s->caster, "LOCAL") || np->virtual || livesource_exists(caster, np->key, &np->pos)) {
 			r = np;
 			break;
 		}
@@ -554,7 +551,7 @@ struct sourceline *stack_find_pullable(sourcetable_stack_t *stack, char *mountpo
  * Remove a sourcetable identified by host+port in the sourcetable stack.
  * Insert a new one instead, if new_sourcetable is not NULL.
  */
-static void _stack_replace_host(struct caster_state *caster, sourcetable_stack_t *stack, const char *host, unsigned port, struct sourcetable *new_sourcetable, int compare_tv) {
+static void _stack_replace(struct caster_state *caster, sourcetable_stack_t *stack, const char *host, unsigned port, struct sourcetable *new_sourcetable, int compare_tv, int local) {
 	struct sourcetable *s;
 	struct sourcetable *r = NULL;
 
@@ -562,7 +559,9 @@ static void _stack_replace_host(struct caster_state *caster, sourcetable_stack_t
 
 	TAILQ_FOREACH(s, &stack->list, next) {
 		P_RWLOCK_WRLOCK(&s->lock);
-		if (!strcmp(s->caster, host) && s->port == port) {
+		if ((local && s->local && s->filename)
+			||
+		    (host && !strcmp(s->caster, host) && s->port == port)) {
 			r = s;
 			break;
 		}
@@ -571,17 +570,17 @@ static void _stack_replace_host(struct caster_state *caster, sourcetable_stack_t
 
 	if (r) {
 		if (new_sourcetable == NULL || !compare_tv || timercmp(&r->fetch_time, &new_sourcetable->fetch_time, <)) {
+			if (local)
+				logfmt(&caster->flog, LOG_INFO, "Removing %s", s->filename);
 			TAILQ_REMOVE(&stack->list, r, next);
-			if (new_sourcetable != NULL) {
-				P_RWLOCK_UNLOCK(&r->lock);
+			P_RWLOCK_UNLOCK(&r->lock);
+			if (new_sourcetable != NULL)
 				sourcetable_diff(caster, r, new_sourcetable);
-				P_RWLOCK_WRLOCK(&r->lock);
-			}
-			sourcetable_free_unlocked(r);
+			sourcetable_free(r);
 		} else {
 			P_RWLOCK_UNLOCK(&r->lock);
 			if (new_sourcetable != NULL) {
-				sourcetable_free_unlocked(new_sourcetable);
+				sourcetable_free(new_sourcetable);
 				new_sourcetable = NULL;
 			}
 		}
@@ -590,6 +589,8 @@ static void _stack_replace_host(struct caster_state *caster, sourcetable_stack_t
 		/*
 		 * Insert at the right place to keep the stack sorted by decreasing priority.
 		 */
+		if (local)
+			logfmt(&caster->flog, LOG_INFO, "Reloading %s", caster->config->sourcetable_filename);
 		TAILQ_FOREACH(s, &stack->list, next) {
 			if (new_sourcetable->priority >= s->priority) {
 				TAILQ_INSERT_BEFORE(s, new_sourcetable, next);
@@ -605,7 +606,11 @@ static void _stack_replace_host(struct caster_state *caster, sourcetable_stack_t
 }
 
 void stack_replace_host(struct caster_state *caster, sourcetable_stack_t *stack, const char *host, unsigned port, struct sourcetable *new_sourcetable) {
-	_stack_replace_host(caster, stack, host, port, new_sourcetable, 0);
+	_stack_replace(caster, stack, host, port, new_sourcetable, 0, 0);
+}
+
+void stack_replace_local(struct caster_state *caster, sourcetable_stack_t *stack, struct sourcetable *new_sourcetable) {
+	_stack_replace(caster, stack, NULL, 0, new_sourcetable, 0, 1);
 }
 
 /*
@@ -655,7 +660,7 @@ struct sourcetable *stack_flatten_dist(struct caster_state *caster, sourcetable_
 			/*
 			 * If the mountpoint is from our local table, skip if not live.
 			 */
-			if (local_table && (!sp->virtual && !livesource_find(caster, NULL, sp->key, &sp->pos)))
+			if (local_table && (!sp->virtual && !livesource_exists(caster, sp->key, &sp->pos)))
 				continue;
 
 			struct element *e = hash_table_get_element(r->key_val, sp->key);
@@ -731,7 +736,7 @@ int sourcetable_update_execute(struct caster_state *caster, json_object *j) {
 
 	if (s != NULL) {
 		logfmt(&caster->flog, LOG_DEBUG, "received sourcetable for %s", s->caster);
-		_stack_replace_host(caster, &caster->sourcetablestack, s->caster, s->port, s, 1);
+		_stack_replace(caster, &caster->sourcetablestack, s->caster, s->port, s, 1, 0);
 	}
 	return 200;
 }

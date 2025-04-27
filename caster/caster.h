@@ -35,6 +35,12 @@ struct listener {
 	char *hostname;			// hostname for TLS/SNI
 };
 
+/* Structure passed to signal callback for caster termination */
+struct caster_signal_cb_info {
+	const char *signame;
+	struct caster_state *caster;
+};
+
 /*
  * State for a caster
  */
@@ -50,9 +56,12 @@ struct caster_state {
 		struct hash_table *ipcount;	// count by IP
 	} ntrips;
 
-	struct config *config;
+	_Atomic (struct config *)config;
 	// Configured endpoints, pre-processed in JSON format.
 	json_object *endpoints_json;
+
+	// cached from config to avoid locking
+	int log_level, graylog_log_level;
 
 	const char *config_file;
 	char *config_dir;
@@ -66,11 +75,8 @@ struct caster_state {
 	struct listener **listeners;
 	int listeners_count;
 
-	P_RWLOCK_T configlock;
-	struct auth_entry *host_auth;
-	struct auth_entry *source_auth;
-
-	struct prefix_table *blocklist;
+	// Protect access to the config structures
+	P_MUTEX_T configmtx;
 
 	SSL_CTX *ssl_client_ctx;	// TLS context for fetchers
 
@@ -102,8 +108,9 @@ struct caster_state {
 
 	/* Signal handling */
 	struct event *signalint_event;
-	struct event *signalpipe_event;
+	struct event *signalterm_event;
 	struct event *signalhup_event;
+	struct caster_signal_cb_info sigint_info, sigterm_info;
 
 	/*
 	 * Sourcetable fetcher configuration.
@@ -118,5 +125,13 @@ int caster_main(char *config_file);
 void free_callback(const void *data, size_t datalen, void *extra);
 json_object *caster_endpoints_json(struct caster_state *caster);
 int caster_reload(struct caster_state *this);
+
+static inline struct config *caster_config_getref(struct caster_state *caster) {
+	P_MUTEX_LOCK(&caster->configmtx);
+	struct config *config = caster->config;
+	config_incref(config);
+	P_MUTEX_UNLOCK(&caster->configmtx);
+	return config;
+}
 
 #endif

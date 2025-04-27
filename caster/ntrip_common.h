@@ -164,7 +164,7 @@ struct ntrip_state {
 	struct livesource *own_livesource;
 
 	/* packet feed (RTCM or other) redistribution */
-	time_t last_send;			// last time a packet was resent to someone
+	time_t last_useful;			// last time a packet was resent to someone
 	char persistent;			// Flag: don't unregister & close the livesource even after idle_max_delay
 
 	/*
@@ -177,6 +177,7 @@ struct ntrip_state {
 	struct ntrip_task *task;		// descriptor and callbacks for the current task
 	struct subscriber *subscription;	// current source subscription
 	char *uri;				// URI for requests
+	time_t last_send;			// last time a packet was sent to this client
 
 	/*
 	 * NTRIP server state
@@ -185,6 +186,7 @@ struct ntrip_state {
 	char *user, *password;
 	char *mountpoint;
 	pos_t mountpoint_pos;			// geographical position of the current source
+	pos_t tmp_pos;				// temporary: future source position redistribute_switch_source()
 	char user_agent_ntrip;			// Flag: set if the User-Agent header
 						// contains "ntrip" (case-insensitive)
 	const char *user_agent;			// User-Agent header, if present
@@ -223,10 +225,14 @@ struct ntrip_state {
 	 * Virtual mountpoint handling
 	 */
 	char *virtual_mountpoint;
+
+	/* Our own reference to the current configuration, to reduce locking */
+	struct config *config;
 };
 
 struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *bev,
 	char *host, unsigned short port, const char *uri, char *mountpoint);
+struct config *ntrip_refresh_config(struct ntrip_state *this);
 void ntrip_register(struct ntrip_state *this);
 int ntrip_register_check(struct ntrip_state *this);
 void ntrip_set_fd(struct ntrip_state *this);

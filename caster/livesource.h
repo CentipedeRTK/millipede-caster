@@ -52,6 +52,7 @@ struct livesource {
 	int npackets;
 	enum livesource_state state;
 	enum livesource_type type;
+	_Atomic int refcnt;
 };
 
 /*
@@ -84,7 +85,6 @@ struct livesources {
 	// remote tables by hostname
 	struct hash_table *remote;
 	P_RWLOCK_T lock;
-	P_MUTEX_T delete_lock;
 	unsigned long long serial;
 
 	// This is used to disambiguate a rolled-back serial sequence
@@ -101,15 +101,16 @@ struct request;
 struct livesources *livesource_table_new(const char *hostname, struct timeval *start_date);
 void livesource_table_free(struct livesources *this);
 struct livesource *livesource_new(char *mountpoint, enum livesource_type type, enum livesource_state state);
-int livesource_del(struct livesource *this, struct ntrip_state *st, struct caster_state *caster);
-struct livesource *livesource_connected(struct ntrip_state *st, char *mountpoint, struct livesource **existing);
-struct livesource *livesource_find(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos);
+void livesource_del(struct ntrip_state *st, struct livesource *this);
+int livesource_connected(struct ntrip_state *st, char *mountpoint);
+int livesource_exists(struct caster_state *this, char *mountpoint, pos_t *mountpoint_pos);
 struct livesource *livesource_find_on_demand(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, int sourceline_on_demand, enum livesource_state *new_state);
 struct livesource *livesource_find_and_subscribe(struct caster_state *caster, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, int sourceline_on_demand);
 int livesource_kill_subscribers_unlocked(struct livesource *this, int kill_backlogged);
-void livesource_free(struct livesource *this);
+void livesource_decref(struct livesource *this);
+void livesource_incref(struct livesource *this);
 void livesource_set_state(struct livesource *this, struct caster_state *caster, enum livesource_state state);
-struct subscriber *livesource_add_subscriber(struct livesource *this, struct ntrip_state *st);
+void livesource_add_subscriber(struct ntrip_state *st, struct livesource *this, void *arg1);
 void livesource_del_subscriber(struct ntrip_state *st);
 int livesource_send_subscribers(struct livesource *this, struct packet *packet, struct caster_state *caster);
 struct livesource *livesource_find(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos);

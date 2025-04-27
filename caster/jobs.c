@@ -11,6 +11,7 @@
 #include "conf.h"
 #include "caster.h"
 #include "jobs.h"
+#include "livesource.h"
 #include "ntrip_common.h"
 
 
@@ -53,6 +54,14 @@ static int _joblist_drain(struct jobq *jobq) {
 		STAILQ_REMOVE_HEAD(jobq, next);
 		if (j->type == JOB_NTRIP_UNLOCKED_CONTENT)
 			ntrip_decref(j->ntrip_unlocked_content.st, "_joblist_drain");
+		else if (j->type == JOB_NTRIP_LIVESOURCE) {
+			ntrip_decref(j->ntrip_livesource.st, "_joblist_drain");
+			livesource_decref(j->ntrip_livesource.livesource);
+			free(j->ntrip_livesource.arg1);
+		} else if (j->type == JOB_NTRIP_PACKET) {
+			ntrip_decref(j->ntrip_packet.st, "_joblist_drain");
+			packet_decref(j->ntrip_packet.packet);
+		}
 		n++;
 		free(j);
 	}
@@ -130,7 +139,21 @@ void joblist_run(struct joblist *this) {
 				j->redistribute.cb(j->redistribute.arg);
 			else if (j->type == JOB_NTRIP_UNLOCKED)
 				j->ntrip_unlocked.cb(j->ntrip_unlocked.st);
-			else if (j->type == JOB_NTRIP_UNLOCKED_CONTENT) {
+			else if (j->type == JOB_NTRIP_LIVESOURCE) {
+				j->ntrip_livesource.cb(j->ntrip_livesource.st, j->ntrip_livesource.livesource, j->ntrip_livesource.arg1);
+				struct bufferevent *bev = j->ntrip_livesource.st->bev;
+				bufferevent_lock(bev);
+				ntrip_decref(j->ntrip_livesource.st, "joblist_run");
+				bufferevent_unlock(bev);
+				livesource_decref(j->ntrip_livesource.livesource);
+			} else if (j->type == JOB_NTRIP_PACKET) {
+				j->ntrip_packet.cb(j->ntrip_packet.st, j->ntrip_packet.packet, j->ntrip_packet.arg1);
+				struct bufferevent *bev = j->ntrip_packet.st->bev;
+				bufferevent_lock(bev);
+				ntrip_decref(j->ntrip_packet.st, "joblist_run");
+				packet_decref(j->ntrip_packet.packet);
+				bufferevent_unlock(bev);
+			} else if (j->type == JOB_NTRIP_UNLOCKED_CONTENT) {
 				j->ntrip_unlocked_content.cb(j->ntrip_unlocked_content.st, j->ntrip_unlocked_content.content_cb, j->ntrip_unlocked_content.req);
 				struct bufferevent *bev = j->ntrip_unlocked_content.st->bev;
 				bufferevent_lock(bev);
@@ -272,13 +295,13 @@ static int job_equal(struct job *j1, struct job *j2) {
 static void _joblist_append_generic(struct joblist *this, struct ntrip_state *st, struct job *tmpj) {
 	struct job *j = NULL;
 	if (st == NULL) {
-		P_MUTEX_LOCK(&this->append_mutex);
 		j = (struct job *)malloc(sizeof(struct job));
 		if (j == NULL) {
-			//ntrip_log(st, LOG_CRIT, "Out of memory, cannot allocate job.");
+			ntrip_log(st, LOG_CRIT, "Out of memory, cannot allocate job.");
 			return;
 		}
 		memcpy(j, tmpj, sizeof(*j));
+		P_MUTEX_LOCK(&this->append_mutex);
 		assert(this->append_njobs >= 0);
 		STAILQ_INSERT_TAIL(&this->append_jobq, j, next);
 		this->append_njobs++;
@@ -325,8 +348,8 @@ static void _joblist_append_generic(struct joblist *this, struct ntrip_state *st
 	if (lastj == NULL || !job_equal(lastj, tmpj)) {
 		j = (struct job *)malloc(sizeof(struct job));
 		if (j == NULL) {
-			ntrip_log(st, LOG_CRIT, "Out of memory, cannot allocate job.");
 			P_MUTEX_UNLOCK(&this->append_mutex);
+			ntrip_log(st, LOG_CRIT, "Out of memory, cannot allocate job.");
 			return;
 		}
 
@@ -345,24 +368,32 @@ static void _joblist_append_generic(struct joblist *this, struct ntrip_state *st
 	}
 
 	assert(jobq_was_empty ? (st->newjobs == 1 || st->newjobs == -1) : 1);
+
+	int inserted, njobs = st->njobs, newjobs = st->newjobs;
 	if (st->newjobs == 1) {
 		/*
 		 * Insertion needed in the main job queue.
 		 */
 		assert(st->newjobs != -1);
-		ntrip_log(st, LOG_EDEBUG, "job appended, inserting in joblist ntrip_queue njobs %d newjobs %d", st->njobs, st->newjobs);
+		inserted = 1;
 		STAILQ_INSERT_TAIL(&this->append_queue, st, next);
 		this->append_ntrip_njobs++;
 		st->newjobs = -1;
 	} else {
 		assert(st->newjobs == -1);
-		ntrip_log(st, LOG_EDEBUG, "job appended, ntrip already in job list, njobs %d newjobs %d", st->njobs, st->newjobs);
+		inserted = 0;
 	}
+
+	P_MUTEX_UNLOCK(&this->append_mutex);
+
+	/* Log message out of locks to avoid deadlocks */
+	ntrip_log(st, LOG_EDEBUG, "job appended, ntrip %s in joblist ntrip_queue njobs %d newjobs %d",
+		inserted?"inserted":"already in",
+		njobs, newjobs);
 
 	/*
 	 * Signal waiting workers there is a new job.
 	 */
-	P_MUTEX_UNLOCK(&this->append_mutex);
 	P_MUTEX_LOCK(&this->condlock);
 	if (pthread_cond_signal(&this->condjob) != 0)
 		caster_log_error(this->caster, "pthread_cond_signal");
@@ -416,6 +447,10 @@ void joblist_append_redistribute(struct joblist *this, void (*cb)(struct redistr
 }
 
 /*
+ * Queue a new livesource job
+ */
+
+/*
  * Queue a new unlocked ntrip job, or directly execute in unthreaded mode.
  */
 void joblist_append_ntrip_unlocked(struct joblist *this, void (*cb)(struct ntrip_state *st), struct ntrip_state *st) {
@@ -427,6 +462,47 @@ void joblist_append_ntrip_unlocked(struct joblist *this, void (*cb)(struct ntrip
 		_joblist_append_generic(this, NULL, &tmpj);
 	} else
 		cb(st);
+}
+
+/*
+ * Queue a new ntrip+livesource job, or directly execute in unthreaded mode.
+ * Handle ntrip & livesource reference counts and free() arg1 if drained
+ * from queue.
+ */
+void joblist_append_ntrip_livesource(struct joblist *this, void (*cb)(struct ntrip_state *st, struct livesource *livesource, void *arg1),
+	struct ntrip_state *st, struct livesource *livesource, void *arg1) {
+	if (threads) {
+		struct job tmpj;
+		tmpj.type = JOB_NTRIP_LIVESOURCE;
+		tmpj.ntrip_livesource.cb = cb;
+		tmpj.ntrip_livesource.st = st;
+		tmpj.ntrip_livesource.livesource = livesource;
+		tmpj.ntrip_livesource.arg1 = arg1;
+		ntrip_incref(st, "joblist_append_ntrip_livesource");
+		livesource_incref(livesource);
+		_joblist_append_generic(this, NULL, &tmpj);
+	} else
+		cb(st, livesource, arg1);
+}
+
+/*
+ * Queue a new ntrip+packet job, or directly execute in unthreaded mode.
+ * Handle ntrip & packet reference counts.
+ */
+void joblist_append_ntrip_packet(struct joblist *this, void (*cb)(struct ntrip_state *st, struct packet *packet, void *arg1),
+	struct ntrip_state *st, struct packet *packet, void *arg1) {
+	if (threads) {
+		struct job tmpj;
+		tmpj.type = JOB_NTRIP_PACKET;
+		tmpj.ntrip_packet.cb = cb;
+		tmpj.ntrip_packet.st = st;
+		tmpj.ntrip_packet.packet = packet;
+		tmpj.ntrip_packet.arg1 = arg1;
+		ntrip_incref(st, "joblist_append_ntrip_packet");
+		packet_incref(packet);
+		_joblist_append_generic(this, NULL, &tmpj);
+	} else
+		cb(st, packet, arg1);
 }
 
 /*

@@ -114,17 +114,24 @@ int ip_convert(const char *ipstr, union sock *sock) {
  * Parse a string containing IP[/prefixlen].
  * If prefixlen is not provided, use /128 for IPv6, /32 for IPv4.
  */
-static int _prefix_parse(char *ipstr, union sock *sock, int *prefixlen) {
+int ip_prefix_parse(const char *ipstr, union sock *sock, int *prefixlen) {
 	int pmax;
+	const int MAX_IP_LEN = 40;
+	char ip[MAX_IP_LEN];
 
+	int len = 0;
 	char *p = strchr(ipstr, '/');
-	if (p != NULL) {
-		*p++ = '\0';
-		if (sscanf(p, "%d", prefixlen) != 1)
-			return 0;
-	}
 
-	if (ip_convert(ipstr, sock) <= 0)
+	len = p ? (p - ipstr) : strlen(ipstr);
+	if (len > MAX_IP_LEN)
+		return 0;
+	memcpy(ip, ipstr, len);
+	ip[len] = '\0';
+
+	if (p && sscanf(p+1, "%d", prefixlen) != 1)
+		return 0;
+
+	if (ip_convert(ip, sock) <= 0)
 		return 0;
 	switch(sock->generic.sa_family) {
 	case AF_INET6:
@@ -183,7 +190,7 @@ static int _prefix_check_ip(union sock *sock, int prefixlen) {
  * Parse a prefix + quota pair.
  * Return a filled struct prefix_quota.
  */
-struct prefix_quota *prefix_quota_parse(char *ip_prefix, const char *quota_str) {
+struct prefix_quota *prefix_quota_parse(const char *ip_prefix, const char *quota_str) {
 	int quota, prefixlen;
 
 	if (sscanf(quota_str, "%u", &quota) != 1 || quota < -1)
@@ -193,14 +200,14 @@ struct prefix_quota *prefix_quota_parse(char *ip_prefix, const char *quota_str) 
 	if (!r)
 		return NULL;
 
-	if (_prefix_parse(ip_prefix, &r->addr, &prefixlen) <= 0) {
+	if (ip_prefix_parse(ip_prefix, &r->prefix.addr, &prefixlen) <= 0) {
 		free(r);
 		return NULL;
 	}
 	r->quota = quota;
-	r->len = prefixlen;
+	r->prefix.len = prefixlen;
 
-	if (_prefix_check_ip(&r->addr, prefixlen) < 0) {
+	if (_prefix_check_ip(&r->prefix.addr, prefixlen) < 0) {
 		free(r);
 		return NULL;
 	}
@@ -213,9 +220,9 @@ struct prefix_quota *prefix_quota_parse(char *ip_prefix, const char *quota_str) 
 char *prefix_quota_str(struct prefix_quota *ppq) {
 	char ip[50];
 	int maxlen = sizeof(ip)+15;
-	ip_str(&ppq->addr, ip, sizeof ip);
+	ip_str(&ppq->prefix.addr, ip, sizeof ip);
 	char *r = (char *)malloc(maxlen);
-	snprintf(r, maxlen, "%s/%d %d", ip, ppq->len, ppq->quota);
+	snprintf(r, maxlen, "%s/%d %d", ip, ppq->prefix.len, ppq->quota);
 	return r;
 }
 
@@ -226,9 +233,9 @@ static int _cmp_prefix(const void *p1, const void *p2) {
 	struct prefix_quota *qp1 = *(struct prefix_quota **)p1;
 	struct prefix_quota *qp2 = *(struct prefix_quota **)p2;
 
-	if (qp1->len < qp2->len)
+	if (qp1->prefix.len < qp2->prefix.len)
 		return -1;
-	if (qp1->len > qp2->len)
+	if (qp1->prefix.len > qp2->prefix.len)
 		return 1;
 	return 0;
 }
@@ -261,7 +268,7 @@ static int _monofamily_prefix_table_add(struct _monofamily_prefix_table *this, s
  * Add an element to an aggregate prefix table, choosing the right protocol.
  */
 static int _prefix_table_add(struct prefix_table *this, struct prefix_quota *new_entry) {
-	if (new_entry->addr.generic.sa_family == AF_INET6)
+	if (new_entry->prefix.addr.generic.sa_family == AF_INET6)
 		return _monofamily_prefix_table_add(&this->v6_table, new_entry);
 	else
 		return _monofamily_prefix_table_add(&this->v4_table, new_entry);
@@ -270,7 +277,7 @@ static int _prefix_table_add(struct prefix_table *this, struct prefix_quota *new
 /*
  * Check whether addr is inside the prefix.
  */
-static int _in_prefix(struct prefix_quota *prefix, union sock *addr) {
+static int _in_prefix(struct prefix *prefix, union sock *addr) {
 	unsigned char *a, *ap;
 	int lenfull, remain;
 
@@ -303,7 +310,7 @@ static int _in_prefix(struct prefix_quota *prefix, union sock *addr) {
  */
 static int _monofamily_prefix_table_get_quota(struct _monofamily_prefix_table *this, union sock *addr) {
 	for (int i = this->nentries-1; i >= 0; i--)
-		if (_in_prefix(this->entries[i], addr))
+		if (_in_prefix(&this->entries[i]->prefix, addr))
 			return this->entries[i]->quota;
 	return -1;
 }
@@ -327,20 +334,11 @@ int prefix_table_get_quota(struct prefix_table *this, union sock *addr) {
 /*
  * Return a new prefix table, filled from the provided file name.
  */
-struct prefix_table *prefix_table_new(const char *filename, struct log *log) {
-	struct parsed_file *p;
+struct prefix_table *prefix_table_new() {
 	struct prefix_table *this = (struct prefix_table *)malloc(sizeof(struct prefix_table));
 
 	if (this == NULL)
 		return NULL;
-
-	p = file_parse(filename, 2, "\t ", 1, log);
-
-	if (p == NULL) {
-		logfmt(log, LOG_ERR, "Can't read or parse %s", filename);
-		free(this);
-		return NULL;
-	}
 
 	this->v4_table.maxentries = 0;
 	this->v4_table.nentries = 0;
@@ -348,6 +346,17 @@ struct prefix_table *prefix_table_new(const char *filename, struct log *log) {
 	this->v6_table.maxentries = 0;
 	this->v6_table.nentries = 0;
 	this->v6_table.entries = NULL;
+
+	return this;
+}
+
+int prefix_table_read(struct prefix_table *this, const char *filename, struct log *log) {
+	struct parsed_file *p;
+	p = file_parse(filename, 2, "\t ", 1, log);
+	if (p == NULL) {
+		logfmt(log, LOG_ERR, "Can't read or parse %s", filename);
+		return -1;
+	}
 
 	for (int n = 0; n < p->nlines; n++) {
 		struct prefix_quota *pq;
@@ -359,7 +368,7 @@ struct prefix_table *prefix_table_new(const char *filename, struct log *log) {
 	}
 	file_free(p);
 	_prefix_table_sort(this);
-	return this;
+	return 0;
 }
 
 /*

@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -5,6 +6,7 @@
 
 #include "ntrip_common.h"
 #include "config.h"
+#include "ip.h"
 #include "util.h"
 
 /*
@@ -393,6 +395,8 @@ struct config *config_parse(const char *filename) {
 		return NULL;
 	}
 
+	atomic_init(&this->refcnt, 1);
+
 #define	DEFAULT_ASSIGN(this, field)		{if (!(this)->field) {(this)->field = default_config.field;}}
 #define	DEFAULT_ASSIGN_ARRAY(this, i, struct1, struct2, field)	{if (!(this)->struct1[i].field) {(this)->struct1[i].field = struct2.field;}}
 
@@ -469,6 +473,9 @@ struct config *config_parse(const char *filename) {
 		if (this->threads[i].stacksize == 0)
 			this->threads[i].stacksize = default_config_threads.stacksize;
 	}
+	this->host_auth = NULL;
+	this->source_auth = NULL;
+	this->blocklist = NULL;
 	return this;
 }
 
@@ -517,13 +524,29 @@ void config_free(struct config *this) {
 	}
 	free(this->graylog);
 
+	for (int i = 0; i < this->rtcm_filter_count; i++) {
+		for (int j = 0; j < this->rtcm_filter[i].convert_count; j++)
+			free((char *)this->rtcm_filter[i].convert[j].types);
+		free(this->rtcm_filter[i].convert);
+		free((char *)this->rtcm_filter[i].apply);
+		free((char *)this->rtcm_filter[i].pass);
+	}
+	free(this->rtcm_filter);
+
 	free(this->threads);
 
+	free((char *)this->syncer_auth);
 	free((char *)this->host_auth_filename);
 	free((char *)this->source_auth_filename);
 	free((char *)this->blocklist_filename);
 	free((char *)this->sourcetable_filename);
 	free((char *)this->log);
 	free((char *)this->access_log);
+	if (this->host_auth)
+		auth_free(this->host_auth);
+	if (this->source_auth)
+		auth_free(this->source_auth);
+	if (this->blocklist)
+		prefix_table_free(this->blocklist);
 	free(this);
 }

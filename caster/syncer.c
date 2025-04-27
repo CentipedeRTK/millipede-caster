@@ -96,8 +96,7 @@ end_cb(int ok, void *arg, int n) {
 	 */
 	queue_checkserial(a, n);
 
-	if (a->task[n]->state != TASK_STOPPED)
-		ntrip_task_reschedule(a->task[n], a);
+	ntrip_task_reschedule(a->task[n], a);
 }
 
 /*
@@ -190,10 +189,8 @@ struct syncer *syncer_new(struct caster_state *caster,
 }
 
 void syncer_free(struct syncer *this) {
-	for (int i = 0; i < this->ntask; i++) {
-		ntrip_task_stop(this->task[i]);
+	for (int i = 0; i < this->ntask; i++)
 		ntrip_task_free(this->task[i]);
-	}
 	free(this->task);
 	free(this);
 }

@@ -18,22 +18,26 @@ static void redistribute_start(void *, int n);
  * Required lock: ntrip_state
  *
  * Switch client from a given source to another.
+ *
+ * Required lock: ntrip_state
  */
-int redistribute_switch_source(struct ntrip_state *this, char *new_mountpoint, pos_t *mountpoint_pos, struct livesource *livesource) {
-	ntrip_log(this, LOG_INFO, "Switching virtual source from %s to %s", this->virtual_mountpoint, new_mountpoint);
-	new_mountpoint = mystrdup(new_mountpoint);
-	if (new_mountpoint == NULL)
-		return -1;
+void redistribute_switch_source(struct ntrip_state *this, struct livesource *livesource, void *arg1) {
+	ntrip_log(this, LOG_INFO, "Switching virtual source from %s to %s", this->virtual_mountpoint, livesource->mountpoint);
+	char *new_mountpoint = mystrdup(livesource->mountpoint);
+	if (new_mountpoint == NULL) {
+		ntrip_log(this, LOG_NOTICE, "Unable to switch source from %s to %s", this->virtual_mountpoint, livesource->mountpoint);
+		livesource_decref(livesource);
+		return;
+	}
 	if (this->subscription) {
 		livesource_del_subscriber(this);
 	}
-	this->subscription = livesource_add_subscriber(livesource, this);
+	livesource_add_subscriber(this, livesource, NULL);
 	this->subscription->virtual = 1;
 	if (this->virtual_mountpoint)
 		strfree(this->virtual_mountpoint);
 	this->virtual_mountpoint = new_mountpoint;
-	this->mountpoint_pos = *mountpoint_pos;
-	return 0;
+	this->mountpoint_pos = this->tmp_pos;
 }
 
 /*
@@ -43,7 +47,8 @@ int redistribute_switch_source(struct ntrip_state *this, char *new_mountpoint, p
 struct redistribute_cb_args *
 redistribute_args_new(struct caster_state *caster, struct livesource *livesource,
 	struct endpoint *e,
-	char *mountpoint, pos_t *mountpoint_pos, int reconnect_delay, int persistent) {
+	char *mountpoint, pos_t *mountpoint_pos, int reconnect_delay, int persistent,
+	int on_demand_source_timeout) {
 	struct redistribute_cb_args *this;
 	this = (struct redistribute_cb_args *)malloc(sizeof(struct redistribute_cb_args));
 	char *uri = (char *)strmalloc(strlen(mountpoint)+2);
@@ -82,15 +87,17 @@ redistribute_args_new(struct caster_state *caster, struct livesource *livesource
 	endpoint_copy(&this->endpoint, e);
 	this->persistent = persistent;
 	this->livesource = livesource;
+	livesource_incref(livesource);
+	this->on_demand_source_timeout = on_demand_source_timeout;
 	return this;
 }
 
 void
 redistribute_args_free(struct redistribute_cb_args *this) {
-	ntrip_task_stop(this->task);
 	if (this->task)
 		ntrip_task_free(this->task);
 	endpoint_free(&this->endpoint);
+	livesource_decref(this->livesource);
 	strfree(this->uri);
 	free(this);
 }
@@ -140,8 +147,8 @@ redistribute_source_stream(struct redistribute_cb_args *this) {
 
 	this->task->port = port;
 	this->task->tls = tls;
-	this->task->read_timeout = this->caster->config->on_demand_source_timeout;
-	this->task->write_timeout = this->caster->config->on_demand_source_timeout;
+	this->task->read_timeout = this->on_demand_source_timeout;
+	this->task->write_timeout = this->on_demand_source_timeout;
 
 	if (ntrip_task_start(this->task, NULL, this->livesource, this->persistent) < 0)
 		logfmt(&this->caster->flog, LOG_CRIT, "ntrip_task_start failed, cannot redistribute %s", this->mountpoint);
@@ -167,15 +174,16 @@ redistribute_start(void *arg_cb, int n) {
 static void
 redistribute_end_cb(int ok, void *arg, int n) {
 	struct redistribute_cb_args *this = (struct redistribute_cb_args *)arg;
-	struct ntrip_state *st = ntrip_task_clear_st(this->task);
+	struct ntrip_state *st = ntrip_task_clear_get_st(this->task, 1);
 	if (!ok && st && st->own_livesource) {
 		if (this->persistent) {
 			livesource_set_state(this->livesource, this->caster, LIVESOURCE_FETCH_PENDING);
-			if (this->task->state != TASK_STOPPED)
-				ntrip_task_reschedule(this->task, this);
+			ntrip_task_reschedule(this->task, this);
 		} else {
 			ntrip_unregister_livesource(st);
 			redistribute_args_free(this);
 		}
 	}
+	if (st)
+		ntrip_decref(st, "redistribute_end_cb");
 }
