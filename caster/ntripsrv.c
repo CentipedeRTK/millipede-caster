@@ -772,6 +772,14 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 			// will increment st->received_bytes itself
 			rtcm_packet_handle(st);
 			break;
+		} else if (st->state == NTRIP_FORCE_CLOSE) {
+			err = 1;
+			break;
+		} else {
+			/* Catchall for unknown states */
+			st->state = NTRIP_FORCE_CLOSE;
+			err = 1;
+			break;
 		}
 
 		if (line) {
