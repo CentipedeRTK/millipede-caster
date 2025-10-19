@@ -172,7 +172,8 @@ int livesource_kill_subscribers_unlocked(struct livesource *this, int kill_backl
 		if (kill_backlogged == 0 || np->backlogged) {
 			struct ntrip_state *st = np->ntrip_state;
 			_livesource_del_subscriber_unlocked(st);
-			ntrip_decref_end(st, "livesource_kill_subscribers_unlocked");
+			if (!np->backlogged && !np->virtual)
+				ntrip_decref_end(st, "livesource_kill_subscribers_unlocked");
 		}
 		bufferevent_unlock(bev);
 	}
@@ -221,14 +222,15 @@ void livesource_add_subscriber(struct ntrip_state *st, struct livesource *this, 
 	if (sub != NULL) {
 		sub->livesource = this;
 		sub->backlogged = 0;
-		sub->virtual = 0;
 
 		bufferevent_lock(st->bev);
 		int cancel = (st->state == NTRIP_END);
 		if (!cancel) {
+			int *virtual = (int *)arg1;
 			assert(st->subscription == NULL);
 			st->subscription = sub;
 			sub->ntrip_state = st;
+			sub->virtual = virtual?*virtual:0;
 		}
 		bufferevent_unlock(st->bev);
 		if (cancel) {

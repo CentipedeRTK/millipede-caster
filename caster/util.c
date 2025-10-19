@@ -244,7 +244,10 @@ int parse_gga(const char *line, pos_t *pos) {
 			if (sscanf(token, "%2f%f", &s1, &s2) != 2) {
 				err = 1;
 			} else {
-				p.lat = s1 + s2/60;
+				if (s1 < 0 || s2 < 0 || s1 > 90. || s2 >= 60. || s1 + s2/60 > 90.)
+					err = 1;
+				else
+					p.lat = s1 + s2/60;
 			}
 			break;
 		case 3:
@@ -260,7 +263,10 @@ int parse_gga(const char *line, pos_t *pos) {
 			if (sscanf(token, "%3f%f", &s1, &s2) != 2) {
 				err = 1;
 			} else {
-				p.lon = s1 + s2/60;
+				if (s1 < 0 || s2 < 0 || s1 > 180. || s2 >= 60. || s1 + s2/60 > 180.)
+					err = 1;
+				else
+					p.lon = s1 + s2/60;
 			}
 			break;
 		case 5:
@@ -397,7 +403,7 @@ void iso_date_from_timeval(char *iso_date, size_t iso_date_len, struct timeval *
 	gmtime_r(&t->tv_sec, &date);
 	strftime(iso_date, iso_date_len, "%Y-%m-%dT%H:%M:%SZ", &date);
 	if (iso_date_len >= 25)
-		snprintf(iso_date + 19, 6, ".%03ldZ", t->tv_usec/1000);
+		snprintf(iso_date + 19, 6, ".%03luZ", t->tv_usec/1000);
 }
 
 void timeval_from_iso_date(struct timeval *t, const char *iso_date) {
