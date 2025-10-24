@@ -154,26 +154,27 @@ int livesource_kill_subscribers_unlocked(struct livesource *this, int kill_backl
 	struct subscriber *np, *tnp;
 	int killed = 0;
 	TAILQ_FOREACH_SAFE(np, &this->subscribers, next, tnp) {
-		/* Keep a pointer because it will be possibly destroyed by ntrip_deferred_free() */
-		struct bufferevent *bev = np->ntrip_state->bev;
+		/* Keep pointers and values because np, st or bev may be freed during the loop */
+		struct ntrip_state *st = np->ntrip_state;
+		struct bufferevent *bev = st->bev;
+		int virtual = np->virtual;
+		int backlogged = np->backlogged;
 
 		bufferevent_lock(bev);
 
-		if (kill_backlogged ? np->backlogged : !np->virtual) {
-			ntrip_log(np->ntrip_state, LOG_NOTICE, "dropping due to %s", kill_backlogged?"backlog":"closed source");
+		if (kill_backlogged ? backlogged : !virtual) {
+			ntrip_log(st, LOG_NOTICE, "dropping due to %s", kill_backlogged?"backlog":"closed source");
 			killed++;
-		} else if (kill_backlogged == 0 && np->virtual) {
+		} else if (kill_backlogged == 0 && virtual) {
 			/*
 			 * Try to resubscribe virtual sources to a new source
 			 */
-			joblist_append_ntrip_locked(np->ntrip_state->caster->joblist, np->ntrip_state, &ntripsrv_redo_virtual_pos);
+			joblist_append_ntrip_locked(st->caster->joblist, st, &ntripsrv_redo_virtual_pos);
 		}
 
-		if (kill_backlogged == 0 || np->backlogged) {
-			struct ntrip_state *st = np->ntrip_state;
-			int end = !np->backlogged && !np->virtual;
+		if (kill_backlogged == 0 || backlogged) {
 			_livesource_del_subscriber_unlocked(st);
-			if (end)
+			if (!backlogged && !virtual)
 				ntrip_decref_end(st, "livesource_kill_subscribers_unlocked");
 		}
 		bufferevent_unlock(bev);
@@ -294,6 +295,7 @@ int livesource_send_subscribers(struct livesource *this, struct packet *packet, 
 	struct packet *pconv = NULL, *p;
 	time_t t = time(NULL);
 	int n = 0;
+	int is_pos = rtcm_packet_is_pos(packet);
 
 	if (this == NULL)
 		/* Dead livesource */
@@ -324,6 +326,14 @@ int livesource_send_subscribers(struct livesource *this, struct packet *packet, 
 			bufferevent_unlock(bev);
 			n++;
 			continue;
+		}
+		if (st->rtcm_client_state == NTRIP_RTCM_POS_WAIT) {
+			if (!is_pos) {
+				bufferevent_unlock(bev);
+				n++;
+				continue;
+			}
+			st->rtcm_client_state = NTRIP_RTCM_POS_OK;
 		}
 		p = packet;
 		if (st->rtcm_filter && !rtcm_filter_pass(st->caster->rtcm_filter, packet)) {

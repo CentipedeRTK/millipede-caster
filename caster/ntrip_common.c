@@ -115,6 +115,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->content_type = NULL;
 	this->client = 0;
 	this->rtcm_filter = 0;
+	this->rtcm_client_state = NTRIP_RTCM_POS_WAIT;
 
 	this->config = caster_config_getref(this->caster);
 	this->lookup_dist = this->config->max_nearest_lookup_distance_m;
@@ -571,25 +572,28 @@ void ntrip_deferred_run(struct caster_state *this) {
 
 /*
  * Drop a connection by ID
+ * Drop all connections if id == 0
  */
 int ntrip_drop_by_id(struct caster_state *caster, long long id) {
 	int r = 0;
 
-	struct ntrip_state *st;
-	P_RWLOCK_RDLOCK(&caster->ntrips.lock);
-	TAILQ_FOREACH(st, &caster->ntrips.queue, nextg) {
+	struct ntrip_state *st, *tmpst;
+	P_RWLOCK_WRLOCK(&caster->ntrips.lock);
+	TAILQ_FOREACH_SAFE(st, &caster->ntrips.queue, nextg, tmpst) {
 		struct bufferevent *bev = st->bev;
 		bufferevent_lock(bev);
-		if (st->id > id) {
+		if (id && st->id > id) {
 			bufferevent_unlock(bev);
 			break;
 		}
-		if (st->id == id) {
+		if (id == 0 || st->id == id) {
 			ntrip_notify_close(st);
 			ntrip_decref_end(st, "ntrip_drop_by_id");
-			bufferevent_unlock(bev);
-			r = 1;
-			break;
+			r += 1;
+			if (id) {
+				bufferevent_unlock(bev);
+				break;
+			}
 		}
 		bufferevent_unlock(bev);
 	}
@@ -846,4 +850,18 @@ void ntrip_set_rtcm_cache(struct ntrip_state *st) {
 	}
 	st->rtcm_info = rp;
 	P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
+}
+
+struct packet *ntrip_get_rtcm_pos(struct ntrip_state *st, const char *mountpoint) {
+	P_RWLOCK_RDLOCK(&st->caster->rtcm_lock);
+	struct rtcm_info *rp = (struct rtcm_info *)hash_table_get(st->caster->rtcm_cache, mountpoint);
+	if (rp == NULL) {
+		P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
+		return NULL;
+	}
+	struct packet *p = rtcm_info_pos_packet(rp, st->caster);
+	if (p)
+		packet_incref(p);
+	P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
+	return p;
 }

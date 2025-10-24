@@ -193,6 +193,17 @@ static unsigned long rtcm_crc24q_hash(unsigned char *data, size_t len) {
 	return crc;
 }
 
+static int rtcm_crc_check(struct packet *p) {
+	int len = p->datalen;
+	if (len < 4)
+		return 0;
+	unsigned long crc = rtcm_crc24q_hash(p->data, len-3);
+	unsigned long packet_crc = (p->data[len-3]<<16) + (p->data[len-2]<<8) + (p->data[len-1]);
+	if (crc != packet_crc)
+		return 0;
+	return 1;
+}
+
 // WGS84 constants
 static double a = 6378137.0;
 static double e = 8.1819190842622e-2;
@@ -273,8 +284,8 @@ static inline uint64_t get_uint64(unsigned char *d, int beg) {
 /*
  * Handle packet types 1005 and 1006: base position.
  */
-static void handle_1005_1006(struct rtcm_info *rp, int type, unsigned char *d, int len) {
-	unsigned char *data = d+3;
+static void handle_1005_1006(struct rtcm_info *rp, int type, struct packet *p) {
+	unsigned char *data = p->data+3;
 	uint64_t ecef_x, ecef_y, ecef_z;
 
 	ecef_x = get_int38(data, 34);
@@ -282,13 +293,19 @@ static void handle_1005_1006(struct rtcm_info *rp, int type, unsigned char *d, i
 	ecef_z = get_int38(data, 114);
 
 	if (type == 1005) {
+		packet_incref(p);
 		gettimeofday(&rp->posdate, NULL);
 		rp->date1005 = rp->posdate;
-		memcpy(&rp->copy1005, d, sizeof(rp->copy1005));
+		if (rp->copy1005)
+			packet_decref(rp->copy1005);
+		rp->copy1005 = p;
 	} else if (type == 1006) {
+		packet_incref(p);
 		gettimeofday(&rp->posdate, NULL);
 		rp->date1006 = rp->posdate;
-		memcpy(&rp->copy1006, d, sizeof(rp->copy1006));
+		if (rp->copy1006)
+			packet_decref(rp->copy1006);
+		rp->copy1006 = p;
 	}
 	rp->x = ecef_x;
 	rp->y = ecef_y;
@@ -588,11 +605,36 @@ struct rtcm_info *rtcm_info_new() {
 	if (this == NULL)
 		return NULL;
 	rtcm_typeset_init(&this->typeset);
+	memset(&this->date1005, 0, sizeof(this->date1005));
+	memset(&this->date1006, 0, sizeof(this->date1006));
+	this->copy1005 = NULL;
+	this->copy1006 = NULL;
 	return this;
 }
 
 void rtcm_info_free(struct rtcm_info *this) {
+	if (this->copy1005)
+		packet_decref(this->copy1005);
+	if (this->copy1006)
+		packet_decref(this->copy1006);
 	free(this);
+}
+
+/*
+ * Return a pointer to the most recent 1005 or 1006 packet, if any.
+ */
+struct packet *rtcm_info_pos_packet(struct rtcm_info *this, struct caster_state *caster) {
+	struct packet *p = NULL;
+	struct timeval *date = NULL;
+	if (this->copy1006) {
+		p = this->copy1006;
+		date = &this->date1006;
+	}
+	if (this->copy1005 && (date == NULL || date->tv_sec < this->date1005.tv_sec))
+		p = this->copy1005;
+	if (p)
+		packet_incref(p);
+	return p;
 }
 
 /*
@@ -671,8 +713,8 @@ int rtcm_filter_check_mountpoint(struct caster_state *caster, const char *mountp
 	return hash_table_get_element(caster->rtcm_filter_dict, mountpoint) != NULL;
 }
 
-static void handle_1006(struct rtcm_info *rp, unsigned char *d, int len) {
-	handle_1005_1006(rp, 1006, d, len);
+static void handle_1006(struct rtcm_info *rp, struct packet *p) {
+	handle_1005_1006(rp, 1006, p);
 	// d += 3;
 	// unsigned short antenna_height = getbits(d, 152, 16);
 }
@@ -709,6 +751,18 @@ json_object *rtcm_info_json(struct rtcm_info *this) {
 	return j;
 }
 
+/*
+ * Return whether a packet is a position packet (types 1005 or 1006).
+ */
+int rtcm_packet_is_pos(struct packet *p) {
+	unsigned char *d = p->data;
+	int len = p->datalen;
+	if (!p->is_rtcm || len < 25)
+		return 0;
+	unsigned short type = getbits(d+3, 0, 12);
+	return (type == 1005 && len == 25) || (type == 1006 && len == 27);
+}
+
 static void rtcm_handler(struct ntrip_state *st, struct packet *p, void *arg1) {
 	struct rtcm_info *rp = (struct rtcm_info *)arg1;
 	if (!rp)
@@ -722,9 +776,9 @@ static void rtcm_handler(struct ntrip_state *st, struct packet *p, void *arg1) {
 	rtcm_typeset_set(&rp->typeset, type);
 
 	if (type == 1005 && len == 25)
-		handle_1005_1006(rp, 1005, d, len);
+		handle_1005_1006(rp, 1005, p);
 	else if (type == 1006 && len == 27)
-		handle_1006(rp, d, len);
+		handle_1006(rp, p);
 	P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
 }
 
@@ -784,15 +838,14 @@ int rtcm_packet_handle(struct ntrip_state *st) {
 		}
 
 		evbuffer_remove(input, &rtcmp->data[0], len_rtcm);
-		unsigned long crc = rtcm_crc24q_hash(&rtcmp->data[0], len_rtcm-3);
-		if (crc == (rtcmp->data[len_rtcm-3]<<16)+(rtcmp->data[len_rtcm-2]<<8)+rtcmp->data[len_rtcm-1]) {
+
+		if (rtcm_crc_check(rtcmp)) {
 			rtcmp->is_rtcm = 1;
 			unsigned short type = getbits(rtcmp->data+3, 0, 12);
 			ntrip_log(st, LOG_DEBUG, "RTCM source %s size %d type %d", st->mountpoint, len_rtcm, type);
 			joblist_append_ntrip_packet(st->caster->joblist, rtcm_handler, st, rtcmp, st->rtcm_info);
-		} else {
-			ntrip_log(st, LOG_INFO, "RTCM: bad checksum! %08lx %08x", crc, (rtcmp->data[len_rtcm-3]<<16)+(rtcmp->data[len_rtcm-2]<<8)+rtcmp->data[len_rtcm-1]);
-		}
+		} else
+			ntrip_log(st, LOG_INFO, "RTCM: bad checksum!");
 
 		if (livesource_send_subscribers(st->own_livesource, rtcmp, st->caster))
 			st->last_useful = time(NULL);

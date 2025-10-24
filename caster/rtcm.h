@@ -31,8 +31,7 @@ struct rtcm_info {
 	// ECEF coordinates for a base, in tenths of millimeters
 	long x, y, z;
 	struct rtcm_typeset typeset;
-	char copy1005[25];
-	char copy1006[27];
+	struct packet *copy1005, *copy1006;
 	struct timeval date1005, date1006, posdate;
 };
 
@@ -55,7 +54,9 @@ int rtcm_filter_pass(struct rtcm_filter *this, struct packet *packet);
 struct packet *rtcm_filter_convert(struct rtcm_filter *this, struct ntrip_state *st, struct packet *p);
 struct rtcm_info *rtcm_info_new();
 void rtcm_info_free(struct rtcm_info *this);
+struct packet *rtcm_info_pos_packet(struct rtcm_info *this, struct caster_state *caster);
 json_object *rtcm_info_json(struct rtcm_info *this);
+int rtcm_packet_is_pos(struct packet *p);
 int rtcm_packet_handle(struct ntrip_state *st);
 
 #endif
