@@ -452,7 +452,7 @@ static struct packet *rtcm_convert_msm7(struct ntrip_state *st, struct packet *p
 	if (len_out > 1023)
 		return NULL;
 
-	struct packet *packet = packet_new(len_out+6, st->caster);
+	struct packet *packet = packet_new(len_out+6);
 
 	if (packet == NULL)
 		return NULL;
@@ -582,6 +582,8 @@ int rtcm_filter_pass(struct rtcm_filter *this, struct packet *packet) {
 struct packet *rtcm_filter_convert(struct rtcm_filter *this, struct ntrip_state *st, struct packet *packet) {
 	if (!packet->is_rtcm)
 		return NULL;
+	if (this == NULL)
+		return NULL;
 
 	unsigned char *d = packet->data;
 	unsigned short type = getbits(d+3, 0, 12);
@@ -709,8 +711,8 @@ struct rtcm_filter *rtcm_filter_new(const char *pass, const char *convert, enum 
 /*
  * Return whether a mountpoint has a filter.
  */
-int rtcm_filter_check_mountpoint(struct caster_state *caster, const char *mountpoint) {
-	return hash_table_get_element(caster->rtcm_filter_dict, mountpoint) != NULL;
+int rtcm_filter_check_mountpoint(struct caster_dynconfig *dyn, const char *mountpoint) {
+	return hash_table_get_element(dyn->rtcm_filter_dict, mountpoint) != NULL;
 }
 
 static void handle_1006(struct rtcm_info *rp, struct packet *p) {
@@ -743,10 +745,7 @@ json_object *rtcm_info_json(struct rtcm_info *this) {
 		json_object_object_add_ex(jpos, "lon", json_object_new_double(pos.lon), JSON_C_CONSTANT_NEW);
 		json_object_object_add_ex(jpos, "alt", json_object_new_double(alt), JSON_C_CONSTANT_NEW);
 		json_object_object_add_ex(j, "pos", jpos, JSON_C_CONSTANT_NEW);
-
-		char iso_date[30];
-		iso_date_from_timeval(iso_date, sizeof iso_date, &this->posdate);
-		json_object_object_add_ex(jpos, "date", json_object_new_string(iso_date), JSON_C_CONSTANT_NEW);
+		timeval_to_json(&this->posdate, jpos, "date");
 	}
 	return j;
 }
@@ -761,6 +760,18 @@ int rtcm_packet_is_pos(struct packet *p) {
 		return 0;
 	unsigned short type = getbits(d+3, 0, 12);
 	return (type == 1005 && len == 25) || (type == 1006 && len == 27);
+}
+
+void rtcm_packet_dump(struct ntrip_state *st, struct packet *p) {
+	unsigned char *d = p->data;
+	int len = p->datalen;
+	unsigned short type = getbits(d+3, 0, 12);
+	char *out = (char *)strmalloc(4*len + 1);
+	out[4*len] = '\0';
+	for (int i = 0; i < len; i++)
+		snprintf(out + 4*i, 5, "\\x%02x", d[i]);
+	ntrip_log(st, LOG_EDEBUG, "RTCM packet %d: %s", type, out);
+	strfree(out);
 }
 
 static void rtcm_handler(struct ntrip_state *st, struct packet *p, void *arg1) {
@@ -802,14 +813,14 @@ int rtcm_packet_handle(struct ntrip_state *st) {
 		int max_len = evbuffer_get_length(input);
 		int len = p.pos < 0 ? max_len : p.pos;
 		if (len) {
-			struct packet *not_rtcmp = packet_new(len, st->caster);
+			struct packet *not_rtcmp = packet_new(len);
 			evbuffer_remove(input, not_rtcmp->data, len);
 			st->received_bytes += len;
 			ntrip_log(st, LOG_INFO, "resending %zd bytes", len);
 			if (livesource_send_subscribers(st->own_livesource, not_rtcmp, st->caster))
 				st->last_useful = time(NULL);
 			r = 1;
-			packet_free(not_rtcmp);
+			packet_decref(not_rtcmp);
 			max_len -= len;
 		}
 		if (max_len == 0)
@@ -829,7 +840,7 @@ int rtcm_packet_handle(struct ntrip_state *st) {
 			return r;
 		}
 
-		struct packet *rtcmp = packet_new(len_rtcm, st->caster);
+		struct packet *rtcmp = packet_new(len_rtcm);
 		st->received_bytes += len_rtcm;
 		if (rtcmp == NULL) {
 			evbuffer_drain(input, len_rtcm);
@@ -843,13 +854,14 @@ int rtcm_packet_handle(struct ntrip_state *st) {
 			rtcmp->is_rtcm = 1;
 			unsigned short type = getbits(rtcmp->data+3, 0, 12);
 			ntrip_log(st, LOG_DEBUG, "RTCM source %s size %d type %d", st->mountpoint, len_rtcm, type);
+			//rtcm_packet_dump(st, rtcmp);
 			joblist_append_ntrip_packet(st->caster->joblist, rtcm_handler, st, rtcmp, st->rtcm_info);
 		} else
 			ntrip_log(st, LOG_INFO, "RTCM: bad checksum!");
 
 		if (livesource_send_subscribers(st->own_livesource, rtcmp, st->caster))
 			st->last_useful = time(NULL);
-		packet_free(rtcmp);
+		packet_decref(rtcmp);
 		r = 1;
 	}
 }

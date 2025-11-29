@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "conf.h"
+#include "caster.h"
 #include "ntrip_task.h"
 #include "ntripcli.h"
 #include "fetcher_sourcetable.h"
@@ -30,8 +31,11 @@ struct sourcetable_fetch_args *fetcher_sourcetable_new(struct caster_state *cast
 	this->task->line_cb_arg = this;
 	this->task->restart_cb = fetcher_sourcetable_start;
 	this->task->restart_cb_arg = this;
-	this->task->read_timeout = caster->config->sourcetable_fetch_timeout;
-	this->task->write_timeout = caster->config->sourcetable_fetch_timeout;
+	struct config *config = caster_config_getref(caster);
+	this->task->read_timeout = config->sourcetable_fetch_timeout;
+	this->task->write_timeout = config->sourcetable_fetch_timeout;
+	this->task->status_timeout = this->task->read_timeout;
+	config_decref(config);
 
 	this->sourcetable = NULL;
 	this->priority = priority;
@@ -50,8 +54,8 @@ static void task_stop(struct sourcetable_fetch_args *this) {
 }
 
 void fetcher_sourcetable_free(struct sourcetable_fetch_args *this) {
-	stack_replace_host(this->task->caster, &this->task->caster->sourcetablestack, this->task->host, this->task->port, NULL);
-	ntrip_task_free(this->task);
+	fetcher_sourcetable_stop(this);
+	ntrip_task_decref(this->task);
 	free(this);
 }
 
@@ -118,7 +122,7 @@ static int sourcetable_line_cb(struct ntrip_state *st, void *arg_cb, const char 
 			sourcetable_nentries(sourcetable, 0),
 			t1.tv_sec*1000 + t1.tv_usec/1000.);
 		stack_replace_host(a->task->caster, &a->task->caster->sourcetablestack, a->task->host, a->task->port, sourcetable);
-		if (st->caster->syncers_count >= 1) {
+		if (st->config->dyn->syncers_count >= 1) {
 			json_object *j = sourcetable_json(sourcetable);
 			json_object *type = json_object_new_string("sourcetable");
 			json_object_object_add(j, "type", type);

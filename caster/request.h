@@ -1,10 +1,11 @@
-#ifndef _REQUEST_H_
-#define _REQUEST_H_
+#ifndef __REQUEST_H__
+#define __REQUEST_H__
 
 struct caster_state;
 struct json_object;
 
 struct request {
+	struct ntrip_state *st;
 	struct hash_table *hash;
 	struct json_object *json;
 	unsigned short status;

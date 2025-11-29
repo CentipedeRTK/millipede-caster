@@ -67,7 +67,10 @@ struct config_node {
 	/* Maximum queue size for memory backlog */
 	size_t queue_max_size;
 
-	int retry_delay;
+	/* How many seconds to wait for a HTTP status in a reply */
+	int status_timeout;
+
+	int retry_delay, max_retry_delay;
 };
 
 struct config_endpoint {
@@ -93,8 +96,14 @@ struct config_graylog {
 	/* Token for Authorization: HTTP header */
 	const char *authorization;
 
-	/* How many seconds to wait before restarting a failed connection */
+	/* How many seconds to wait for a HTTP status in a reply */
+	int status_timeout;
+
+	/* How many seconds to initially wait before restarting a failed connection */
 	int retry_delay;
+
+	/* How many maximum seconds to wait beteen retries (exponential backoff from retry_delay) */
+	int max_retry_delay;
 
 	/* Maximum size for bulk mode, 0 to disable bulk mode */
 	size_t bulk_max_size;
@@ -278,17 +287,6 @@ struct config {
 	const char *admin_user;
 
 	/*
-	 * Zero copy mode shares outgoing queued RTCM packets, saving memory, but incurring
-	 * some overhead.
-	 *
-	 * Useful if there are many subscribers per source, or a lot of backlog.
-	 */
-	int zero_copy;
-
-	/* Used only for YAML config reading as the CYAML default is 0 */
-	int disable_zero_copy;
-
-	/*
 	 * Web root file paths.
 	 */
 	struct config_webroots *webroots;
@@ -311,6 +309,12 @@ struct config {
 
 	/* Quota/block list by IP prefix */
 	struct prefix_table *blocklist;
+
+	/* Pointer to caster-specific structures derived from config */
+	struct caster_dynconfig *dyn;
+
+	/* Pointer to callback function for housekeeping tasks at config_free() */
+	void (*free_callback)(struct config *config);
 };
 
 extern int backlog_delay;

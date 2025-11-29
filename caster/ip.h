@@ -1,5 +1,5 @@
-#ifndef _IP_H_
-#define _IP_H_
+#ifndef __IP_H__
+#define __IP_H__
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -62,7 +62,7 @@ int prefix_table_add(struct prefix_table *this, struct prefix_quota *new_entry);
 int ip_in_prefix(struct prefix *prefix, union sock *addr);
 int prefix_table_get_quota(struct prefix_table *this, union sock *addr);
 struct prefix_table *prefix_table_new();
-int prefix_table_read(struct prefix_table * this, const char *filename, struct log *log);
+int prefix_table_read(struct prefix_table * this, const char *dir, const char *filename, struct log *log);
 void prefix_table_free(struct prefix_table *this);
 
 #endif

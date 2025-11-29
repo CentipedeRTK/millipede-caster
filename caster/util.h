@@ -36,7 +36,8 @@ struct mime_content {
 	char *s;
 	const char *mime_type;
 	size_t len;
-	int use_strfree;
+	int use_strfree, is_packet;
+	struct packet *packet;
 };
 STAILQ_HEAD(mimeq, mime_content);
 
@@ -66,12 +67,16 @@ void *strrealloc(void *p, size_t len);
 void strfree(void *str);
 int parse_header(char *line, char **key, char **val);
 struct mime_content *mime_new(char *s, long long len, const char *mime_type, int use_strfree);
+struct mime_content *mime_new_from_packet(const char *mime_type, struct packet *packet);
 void mime_set_type(struct mime_content *this, const char *mime_type);
 void mime_free(struct mime_content *this);
-void mime_append(struct mime_content *this, const char *s);
+char *joinpath(const char *dir, const char *path);
+FILE *fopen_absolute(const char *dir, const char *filename, const char *mode);
+
 void iso_date_from_timeval(char *iso_date, size_t iso_date_len, struct timeval *t);
 void timeval_from_iso_date(struct timeval *t, const char *iso_date);
-struct parsed_file *file_parse(const char *filename, int nfields, const char *seps, int skipempty, struct log *log);
+void timeval_to_json(struct timeval *t, json_object *json, const char *json_key);
+struct parsed_file *file_parse(const char *dir, const char *filename, int nfields, const char *seps, int skipempty, struct log *log);
 void file_free(struct parsed_file *p);
 void logdate(char *date, size_t len, struct timeval *ts);
 void filedate(char *filename, size_t len, const char *format);

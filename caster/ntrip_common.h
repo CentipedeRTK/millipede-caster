@@ -5,6 +5,7 @@
 
 #include <event2/event.h>
 #include <openssl/ssl.h>
+#include <json-c/json_object.h>
 
 #include "conf.h"
 #include "caster.h"
@@ -189,6 +190,8 @@ struct ntrip_state {
 	struct subscriber *subscription;	// current source subscription
 	char *uri;				// URI for requests
 	time_t last_send;			// last time a packet was sent to this client
+	json_object *node;			// node information from syncer client
+	char *syncer_id;			// livesource table id from remote syncer
 
 	/*
 	 * NTRIP server state
@@ -238,6 +241,8 @@ struct ntrip_state {
 
 	/* Our own reference to the current configuration, to reduce locking */
 	struct config *config;
+	/* A possibly new configuration, if not NULL */
+	struct config *tmpconfig;
 };
 
 struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *bev,

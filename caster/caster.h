@@ -2,6 +2,7 @@
 #define __CASTER_H__
 
 #include <netinet/in.h>
+#include <stdatomic.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <pthread.h>
@@ -15,6 +16,7 @@
 #include "jobs.h"
 #include "livesource.h"
 #include "log.h"
+#include "nodes.h"
 #include "queue.h"
 #include "rtcm.h"
 #include "sourcetable.h"
@@ -33,11 +35,39 @@ struct listener {
 	int tls;			// is TLS activated?
 	SSL_CTX *ssl_server_ctx;	// TLS context, certs etc.
 	char *hostname;			// hostname for TLS/SNI
+	_Atomic u_int refcnt;
 };
 
 /* Structure passed to signal callback for caster termination */
 struct caster_signal_cb_info {
 	const char *signame;
+	struct caster_state *caster;
+};
+
+/*
+ * Structure used to manage config reload
+ */
+struct caster_dynconfig {
+	/* Array of pointers to listener configurations */
+	struct listener **listeners;
+	int listeners_count;
+
+	/* Graylog senders */
+	struct graylog_sender **graylog;
+	int graylog_count;	/* 0 or 1 */
+
+	/* Sourcetable fetcher configuration */
+	struct sourcetable_fetch_args **sourcetable_fetchers;
+	int sourcetable_fetchers_count;
+
+	/* Table synchronization */
+	struct syncer **syncers;
+	int syncers_count;
+
+	/* RTCM filtering */
+	struct rtcm_filter *rtcm_filter;	// filters (max 1 currently)
+	struct hash_table *rtcm_filter_dict;	// mountpoint => filter dictionary
+
 	struct caster_state *caster;
 };
 
@@ -70,12 +100,10 @@ struct caster_state {
 	struct hash_table *rtcm_cache;
 	P_RWLOCK_T rtcm_lock;
 
-	// Array of pointers to listener configurations
-	struct listener **listeners;
-	int listeners_count;
-
-	// Protect access to the config structures
-	P_MUTEX_T configmtx;
+	// Protect access to the config pointer
+	P_RWLOCK_T configlock;
+	// Serialize simultaneous reloads
+	P_MUTEX_T configreload;
 
 	SSL_CTX *ssl_client_ctx;	// TLS context for fetchers
 
@@ -86,21 +114,16 @@ struct caster_state {
 	 */
 	struct livesources *livesources;
 
-	sourcetable_stack_t sourcetablestack;
+	/*
+	 * Node table
+	 */
+	struct nodes *nodes;
 
-	/* RTCM filtering */
-	struct rtcm_filter *rtcm_filter;	// filters (max 1 currently)
-	struct hash_table *rtcm_filter_dict;	// mountpoint => filter dictionary
+	sourcetable_stack_t sourcetablestack;
 
 	/* Logs */
 	struct log flog, alog;
 	char hostname[128];
-	struct graylog_sender **graylog;
-	int graylog_count;	/* 0 or 1 */
-
-	/* Table synchronization */
-	struct syncer **syncers;
-	int syncers_count;
 
 	/* Thread id (thread-specific variable) for logs */
 	pthread_key_t thread_id;
@@ -110,27 +133,19 @@ struct caster_state {
 	struct event *signalterm_event;
 	struct event *signalhup_event;
 	struct caster_signal_cb_info sigint_info, sigterm_info;
-
-	/*
-	 * Sourcetable fetcher configuration.
-	 */
-	struct sourcetable_fetch_args **sourcetable_fetchers;
-	int sourcetable_fetchers_count;
 };
 
 void caster_log_error(struct caster_state *this, char *orig);
 int caster_tls_log_cb(const char *str, size_t len, void *u);
 int caster_main(char *config_file);
 void free_callback(const void *data, size_t datalen, void *extra);
-json_object *caster_endpoints_json(struct caster_state *caster);
 int caster_reload(struct caster_state *this);
 
 static inline struct config *caster_config_getref(struct caster_state *caster) {
-	P_MUTEX_LOCK(&caster->configmtx);
-	struct config *config = caster->config;
+	P_RWLOCK_RDLOCK(&caster->configlock);
+	struct config *config = atomic_load(&caster->config);
 	config_incref(config);
-	P_MUTEX_UNLOCK(&caster->configmtx);
+	P_RWLOCK_UNLOCK(&caster->configlock);
 	return config;
 }
-
 #endif

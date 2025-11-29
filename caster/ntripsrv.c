@@ -342,7 +342,7 @@ void ntripsrv_redo_virtual_pos(struct ntrip_state *st) {
 					if (packet_pos) {
 						st->rtcm_client_state = NTRIP_RTCM_POS_OK;
 						packet_send(packet_pos, st, time(NULL));
-						packet_free(packet_pos);
+						packet_decref(packet_pos);
 					} else
 						st->rtcm_client_state = NTRIP_RTCM_POS_WAIT;
 					st->tmp_pos = s->dist_array[0].pos;
@@ -404,13 +404,12 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 	int err = 0;
 	struct evbuffer *output = bufferevent_get_output(bev);
 	struct evkeyvalq opt_headers;
-	struct config *config;
 
 	int method_post_source = 0;
 
 	TAILQ_INIT(&opt_headers);
 
-	config = ntrip_refresh_config(st);
+	struct config *config = ntrip_refresh_config(st);
 
 	ntrip_log(st, LOG_EDEBUG, "ntripsrv_readcb state %d len %d", st->state, evbuffer_get_length(st->filter.raw_input));
 
@@ -476,7 +475,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 			}
 			if (!line)
 				break;
-			st->received_bytes += len;
+			st->received_bytes += len + 2;
 			ntrip_log(st, LOG_EDEBUG, "Header \"%s\", %zd bytes", line, len);
 			if (len != 0) {
 				char *key, *value;
@@ -593,7 +592,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					struct livesource *l = NULL;
 
 					if (*mountpoint) {
-						if (st->caster->rtcm_filter && rtcm_filter_check_mountpoint(st->caster, mountpoint))
+						if (config->dyn->rtcm_filter && rtcm_filter_check_mountpoint(config->dyn, mountpoint))
 							st->rtcm_filter = 1;
 						/*
 						 * Find both a relevant source line and a live source (actually live or on-demand).
@@ -687,6 +686,8 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 								break;
 							}
 							st->state = NTRIP_WAIT_CLIENT_CONTENT;
+							struct timeval adm_read_timeout = { 0, 0 };
+							bufferevent_set_timeouts(bev, &adm_read_timeout, NULL);
 							continue;
 						}
 						if (!st->scheme_basic) {
@@ -866,6 +867,9 @@ void ntripsrv_eventcb(struct bufferevent *bev, short events, void *arg)
 {
 	int initial_errno = errno;
 	struct ntrip_state *st = (struct ntrip_state *)arg;
+	struct config *config;
+
+	config = ntrip_refresh_config(st);
 
 	if (events & BEV_EVENT_CONNECTED) {
 		ntrip_log(st, LOG_INFO, "Connected srv");
@@ -888,13 +892,13 @@ void ntripsrv_eventcb(struct bufferevent *bev, short events, void *arg)
 			 */
 			if (st->state == NTRIP_WAIT_CLIENT_INPUT) {
 				int idle_time = time(NULL) - st->last_send;
-				if (idle_time <= st->config->idle_max_delay) {
+				if (idle_time <= config->idle_max_delay) {
 					/* Reenable read */
 					bufferevent_enable(bev, EV_READ);
 					return;
 				}
 				/* No data sent or read, close. */
-				ntrip_log(st, LOG_NOTICE, "last_send: %d seconds ago, max %d, dropping", idle_time, st->config->idle_max_delay);
+				ntrip_log(st, LOG_NOTICE, "last_send: %d seconds ago, max %d, dropping", idle_time, config->idle_max_delay);
 			} else
 				ntrip_log(st, LOG_NOTICE, "ntripsrv read timeout");
 		}
@@ -903,6 +907,14 @@ void ntripsrv_eventcb(struct bufferevent *bev, short events, void *arg)
 	}
 
 	ntrip_log(st, LOG_EDEBUG, "ntrip_free srv_eventcb bev %p", bev);
+
+	if (st->syncer_id) {
+		ntrip_log(st, LOG_DEBUG, "Destroying livesource list %s", st->syncer_id);
+		livesources_remote_replace(st->caster, st->syncer_id, NULL);
+		strfree(st->syncer_id);
+		st->syncer_id = NULL;
+	}
+
 	ntrip_decref_end(st, "ntripsrv_eventcb");
 }
 

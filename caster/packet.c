@@ -6,27 +6,25 @@
 #include "packet.h"
 #include "ntrip_common.h"
 
-struct packet *packet_new(size_t len_raw, struct caster_state *caster) {
+struct packet *packet_new(size_t len_raw) {
 	struct packet *this = (struct packet *)malloc(sizeof(struct packet) + len_raw);
 	this->datalen = len_raw;
 	atomic_init(&this->refcnt, 1);
 	this->is_rtcm = 0;
-	this->zero_copy = caster->config->zero_copy;
 	return this;
 }
 
 /*
- * Packet freeing function with a reference count
- * for zero copy mode.
+ * Create packet with a copy of a null-terminated string.
  */
-void packet_free(struct packet *packet) {
-	if (!packet->zero_copy) {
-		free((void *)packet);
-		return;
-	}
-
-	if (atomic_fetch_add_explicit(&packet->refcnt, -1, memory_order_relaxed) == 1)
-		free((void *)packet);
+struct packet *packet_new_from_string(const char *s) {
+	size_t len = strlen(s);
+	struct packet *p = packet_new(len);
+	if (p == NULL)
+		return NULL;
+	/* Don't store the final '\0' since we know the length */
+	memcpy(p->data, s, len);
+	return p;
 }
 
 void packet_incref(struct packet *packet) {
@@ -43,28 +41,22 @@ void packet_decref(struct packet *packet) {
  */
 static void raw_free_callback(const void *data, size_t datalen, void *extra) {
 	struct packet *packet = (struct packet *)extra;
-	packet_free(packet);
+	packet_decref(packet);
 }
 
 /*
  * Send a packet
  * Required lock: ntrip_state
  */
-void packet_send(struct packet *packet, struct ntrip_state *st, time_t t) {
-	if (packet->zero_copy) {
-		if (evbuffer_add_reference(bufferevent_get_output(st->bev), packet->data, packet->datalen, raw_free_callback, packet) < 0) {
-			ntrip_log(st, LOG_CRIT, "evbuffer_add_reference failed");
-			return;
-		}
-		packet_incref(packet);
-	} else {
-		if (evbuffer_add(bufferevent_get_output(st->bev), packet->data, packet->datalen) < 0) {
-			ntrip_log(st, LOG_CRIT, "evbuffer_add failed");
-			return;
-		}
+int packet_send(struct packet *packet, struct ntrip_state *st, time_t t) {
+	if (evbuffer_add_reference(bufferevent_get_output(st->bev), packet->data, packet->datalen, raw_free_callback, packet) < 0) {
+		ntrip_log(st, LOG_CRIT, "evbuffer_add_reference failed");
+		return -1;
 	}
+	packet_incref(packet);
 	st->last_send = t;
 	st->sent_bytes += packet->datalen;
+	return 0;
 }
 
 int packet_handle_raw(struct ntrip_state *st) {
@@ -77,7 +69,7 @@ int packet_handle_raw(struct ntrip_state *st) {
 			return 0;
 		if (len_raw > st->config->max_raw_packet)
 			len_raw = st->config->max_raw_packet;
-		struct packet *rawp = packet_new(len_raw, st->caster);
+		struct packet *rawp = packet_new(len_raw);
 		st->received_bytes += len_raw;
 		if (rawp == NULL) {
 			evbuffer_drain(input, len_raw);
@@ -89,7 +81,7 @@ int packet_handle_raw(struct ntrip_state *st) {
 		//ntrip_log(st, LOG_DEBUG, "Raw: packet source %s size %d", st->mountpoint, len_raw);
 		if (livesource_send_subscribers(st->own_livesource, rawp, st->caster))
 			st->last_useful = time(NULL);
-		packet_free(rawp);
+		packet_decref(rawp);
 		return 1;
 	}
 }

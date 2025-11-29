@@ -3,12 +3,15 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
 #include <event2/http.h>
 #include <event2/buffer.h>
 
 #include "conf.h"
 #include "ntripcli.h"
 #include "ntrip_task.h"
+#include "util.h"
 
 static void
 _ntrip_task_restart_cb(int fd, short what, void *arg) {
@@ -19,6 +22,20 @@ _ntrip_task_restart_cb(int fd, short what, void *arg) {
 	a->ev = NULL;
 	P_RWLOCK_UNLOCK(&a->mimeq_lock);
 	a->restart_cb(a->restart_cb_arg, a->cb_arg2);
+}
+
+/*
+ * Called on a successful connection.
+ */
+static void connect_cb(struct ntrip_state *st){
+	/* Reinitialize exponential backoff */
+	st->task->current_retry_delay = st->task->refresh_delay;
+
+	if (st->task->use_mimeq) {
+		st->state = NTRIP_IDLE_CLIENT;
+		ntrip_task_send_next_request(st);
+	} else
+		ntripcli_send_request(st, NULL, 0);
 }
 
 /*
@@ -41,11 +58,16 @@ struct ntrip_task *ntrip_task_new(struct caster_state *caster,
 		return NULL;
 	}
 	memset(&this->start, 0, sizeof(this->start));
+	atomic_init(&this->refcnt, 1);
 	this->port = port;
+	this->status_timeout = 0;		// only used with mimeq/task_send_next_request()
 	this->refresh_delay = refresh_delay;
+	this->max_retry_delay = refresh_delay;
+	this->current_retry_delay = refresh_delay;
 	this->end_cb = NULL;
 	this->line_cb = NULL;
 	this->status_cb = NULL;
+	this->connect_cb = connect_cb;
 	this->st = NULL;
 	this->caster = caster;
 	this->ev = NULL;
@@ -79,8 +101,11 @@ struct ntrip_state *ntrip_task_clear_get_st(struct ntrip_task *this, int getref)
 	struct ntrip_state *rst;
 	P_RWLOCK_WRLOCK(&this->st_lock);
 	rst = getref ? this->st : NULL;
-	if (this->st != NULL && !rst)
-		ntrip_decref(this->st ,"ntrip_task_clear_st");
+	if (this->st != NULL) {
+		this->st->task = NULL;
+		if (!rst)
+			ntrip_decref(this->st, "ntrip_task_clear_st");
+	}
 	this->st = NULL;
 	P_RWLOCK_UNLOCK(&this->st_lock);
 	return rst;
@@ -88,6 +113,22 @@ struct ntrip_state *ntrip_task_clear_get_st(struct ntrip_task *this, int getref)
 
 void ntrip_task_clear_st(struct ntrip_task *this) {
 	ntrip_task_clear_get_st(this, 0);
+}
+
+/*
+ * Return a counted reference to the ntrip_state, or NULL.
+ */
+static struct ntrip_state *ntrip_task_get_st_ref(struct ntrip_task *this) {
+	P_RWLOCK_RDLOCK(&this->st_lock);
+	struct ntrip_state *st = this->st;
+	if (st != NULL)
+		ntrip_incref(st, "ntrip_task_get_st_ref");
+	P_RWLOCK_UNLOCK(&this->st_lock);
+	return st;
+}
+
+enum task_state ntrip_task_get_state(struct ntrip_task *this) {
+	return atomic_load_explicit(&this->state, memory_order_relaxed);
 }
 
 static inline void ntrip_task_set_st(struct ntrip_task *this, struct ntrip_state *st) {
@@ -155,14 +196,17 @@ void ntrip_task_reschedule(struct ntrip_task *this, void *arg_cb) {
 	P_RWLOCK_WRLOCK(&this->mimeq_lock);
 	this->pending = 0;
 	if (this->refresh_delay) {
-		struct timeval timeout_interval = { this->refresh_delay, 0 };
+		struct timeval timeout_interval = { this->current_retry_delay, 0 };
 		if (this->ev != NULL)
 			event_free(this->ev);
 		this->ev = event_new(this->caster->base, -1, 0, _ntrip_task_restart_cb, this);
 		if (this->ev) {
 			event_add(this->ev, &timeout_interval);
+			this->current_retry_delay = (this->current_retry_delay?this->current_retry_delay:1)*2;
+			if (this->current_retry_delay > this->max_retry_delay) this->current_retry_delay = this->max_retry_delay;
+
 			P_RWLOCK_UNLOCK(&this->mimeq_lock);
-			logfmt(&this->caster->flog, LOG_INFO, "Starting refresh callback for %s %s:%d in %d seconds", this->type, this->host, this->port, this->refresh_delay);
+			logfmt(&this->caster->flog, LOG_INFO, "Starting refresh callback for %s %s:%d in %d seconds", this->type, this->host, this->port, this->current_retry_delay);
 		} else {
 			P_RWLOCK_UNLOCK(&this->mimeq_lock);
 			logfmt(&this->caster->flog, LOG_CRIT, "Can't schedule refresh callback for %s %s:%d, canceling", this->type, this->host, this->port);
@@ -211,12 +255,12 @@ static size_t ntrip_task_drain_queue(struct ntrip_task *this) {
 	if (this->drainfilename) {
 		char filename[PATH_MAX];
 		filedate(filename, sizeof filename, this->drainfilename);
-		f = fopen(filename, "a+");
+		f = fopen_absolute(this->caster->config_dir, filename, "a+");
 	}
 	while ((m = STAILQ_FIRST(&tmp_mimeq))) {
 		STAILQ_REMOVE_HEAD(&tmp_mimeq, next);
 		if (f != NULL) {
-			fputs(m->s, f);
+			fwrite(m->packet->data, m->packet->datalen, 1, f);
 			fputs("\n", f);
 		}
 		mime_free(m);
@@ -229,11 +273,10 @@ static size_t ntrip_task_drain_queue(struct ntrip_task *this) {
 /*
  * Insert a new item in the queue, checking accepted size.
  */
-void ntrip_task_queue(struct ntrip_task *this, char *json) {
+void ntrip_task_queue(struct ntrip_task *this, struct packet *packet) {
 	if (atomic_load_explicit(&this->state, memory_order_relaxed) == TASK_END)
 		return;
-	char *s = mystrdup(json);
-	struct mime_content *m = mime_new(s, -1, "application/json", 1);
+	struct mime_content *m = mime_new_from_packet("application/json", packet);
 	if (m == NULL) {
 		logfmt(&this->caster->flog, LOG_CRIT, "Out of memory when allocating log output, dropping");
 		return;
@@ -261,23 +304,18 @@ void ntrip_task_queue(struct ntrip_task *this, char *json) {
 
 	int first_sending = atomic_fetch_add_explicit(&this->restart_sending, 1, memory_order_relaxed) == 0;
 	if (first_sending) {
-		P_RWLOCK_RDLOCK(&this->st_lock);
-		struct ntrip_state *st = this->st;
+		struct ntrip_state *st = ntrip_task_get_st_ref(this);
 		if (st != NULL) {
 			struct bufferevent *bev = st->bev;
 			assert(bev != NULL);
-			ntrip_incref(st, "ntrip_task_queue");
-			P_RWLOCK_UNLOCK(&this->st_lock);
-
 			bufferevent_lock(bev);
 			if (st->state == NTRIP_IDLE_CLIENT)
 				ntrip_task_send_next_request(st);
 			ntrip_decref(st, "ntrip_task_queue");
 			bufferevent_unlock(bev);
-		} else
-			P_RWLOCK_UNLOCK(&this->st_lock);
+		}
 	}
-	atomic_fetch_sub_explicit(&this->restart_sending, -1, memory_order_relaxed);
+	atomic_fetch_sub_explicit(&this->restart_sending, 1, memory_order_relaxed);
 }
 
 /*
@@ -327,7 +365,7 @@ void ntrip_task_send_next_request(struct ntrip_state *st) {
 		STAILQ_FOREACH(m, &task->mimeq, next) {
 			if (n == 0)
 				break;
-			if (evbuffer_add_reference(output, m->s, m->len, NULL, NULL) < 0
+			if (packet_send(m->packet, st, time(NULL)) < 0
 			 || evbuffer_add_reference(output, "\n", 1, NULL, NULL) < 0) {
 				P_RWLOCK_UNLOCK(&task->mimeq_lock);
 				ntrip_log(st, LOG_CRIT, "Not enough memory, dropping connection to %s:%d", st->host, st->port);
@@ -343,7 +381,7 @@ void ntrip_task_send_next_request(struct ntrip_state *st) {
 		m = STAILQ_FIRST(&task->mimeq);
 		if (m) {
 			ntripcli_send_request(st, m, 0);
-			if (evbuffer_add_reference(output, m->s, m->len, NULL, NULL) < 0) {
+			if (packet_send(m->packet, st, time(NULL)) < 0) {
 				P_RWLOCK_UNLOCK(&task->mimeq_lock);
 				ntrip_log(st, LOG_CRIT, "Not enough memory, dropping connection to %s:%d", st->host, st->port);
 				ntrip_task_clear_st(task);
@@ -354,6 +392,14 @@ void ntrip_task_send_next_request(struct ntrip_state *st) {
 		}
 	}
 	P_RWLOCK_UNLOCK(&task->mimeq_lock);
+
+	/*
+	 * Only expect a reply from the server if we sent a HTTP request.
+	 * Will close if it times out.
+	 * In other cases, just keep the connection idle.
+	 */
+	struct timeval read_timeout = { st->task->pending ? st->task->status_timeout : 0 };
+	bufferevent_set_timeouts(st->bev, &read_timeout, NULL);
 }
 
 /*
@@ -368,7 +414,6 @@ void ntrip_task_ack_pending(struct ntrip_task *this) {
 	P_RWLOCK_WRLOCK(&this->mimeq_lock);
 	while (this->pending && (m = STAILQ_FIRST(&this->mimeq))) {
 		STAILQ_REMOVE_HEAD(&this->mimeq, next);
-		this->st->sent_bytes += m->len;
 		this->queue_size -= m->len;
 		this->pending--;
 		mime_free(m);
@@ -377,7 +422,7 @@ void ntrip_task_ack_pending(struct ntrip_task *this) {
 	P_RWLOCK_UNLOCK(&this->mimeq_lock);
 }
 
-void ntrip_task_free(struct ntrip_task *this) {
+static void ntrip_task_free(struct ntrip_task *this) {
 	ntrip_task_stop(this);
 	ntrip_task_drain_queue(this);
 
@@ -396,12 +441,21 @@ void ntrip_task_free(struct ntrip_task *this) {
 	free(this);
 }
 
+void ntrip_task_incref(struct ntrip_task *this) {
+	atomic_fetch_add(&this->refcnt, 1);
+}
+
+void ntrip_task_decref(struct ntrip_task *this) {
+	if (atomic_fetch_add_explicit(&this->refcnt, -1, memory_order_relaxed) == 1)
+		ntrip_task_free(this);
+}
+
 void ntrip_task_reload(struct ntrip_task *this,
 	const char *host, unsigned short port, const char *uri, int tls,
-	int retry_delay, int bulk_max_size, int queue_max_size, const char *drainfilename) {
+	int refresh_delay, int bulk_max_size, int queue_max_size, const char *drainfilename) {
 
 	ntrip_task_stop(this);
-	this->refresh_delay = retry_delay;
+	this->refresh_delay = refresh_delay;
 	this->bulk_max_size = bulk_max_size;
 	this->queue_max_size = queue_max_size;
 	strfree((char *)this->uri);

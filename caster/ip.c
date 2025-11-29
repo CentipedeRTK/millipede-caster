@@ -88,6 +88,8 @@ int ip_cmp(union sock *s1, union sock *s2) {
 
 /*
  * Convert a v6 or v4 IP address from a string to a union sock.
+ *
+ * Return 1 if parsing is ok, 0 if not, -1 in case of a system error.
  */
 int ip_convert(const char *ipstr, union sock *sock) {
 	int r;
@@ -358,9 +360,9 @@ struct prefix_table *prefix_table_new() {
 	return this;
 }
 
-int prefix_table_read(struct prefix_table *this, const char *filename, struct log *log) {
+int prefix_table_read(struct prefix_table *this, const char *dir, const char *filename, struct log *log) {
 	struct parsed_file *p;
-	p = file_parse(filename, 2, "\t ", 1, log);
+	p = file_parse(dir, filename, 2, "\t ", 1, log);
 	if (p == NULL) {
 		logfmt(log, LOG_ERR, "Can't read or parse %s", filename);
 		return -1;

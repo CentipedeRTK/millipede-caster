@@ -79,7 +79,7 @@ static char *ntripcli_http_request_str(struct ntrip_state *st,
 
 	int hlen = 0;
 	TAILQ_FOREACH(np, &headers, next) {
-		// lengths of key + value + " " + "\r\n"
+		// lengths of key + value + ": " + "\r\n"
 		hlen += strlen(np->key) + strlen(np->value) + 4;
 	}
 	if (st->task)
@@ -384,7 +384,7 @@ void ntripcli_send_request(struct ntrip_state *st, struct mime_content *m, int s
 	char *s = ntripcli_http_request_str(st, st->task?st->task->method:"GET", st->host, st->port, st->uri, 2, NULL, m);
 	if (s) {
 		len = strlen(s);
-		st->sent_bytes += len + (m ? m->len : 0);
+		st->sent_bytes += len + ((m && send_mime) ? m->len : 0);
 	}
 	if (s == NULL
 	 || evbuffer_add_reference(output, s, len, strfree_callback, s) < 0
@@ -407,14 +407,16 @@ void ntripcli_eventcb(struct bufferevent *bev, short events, void *arg) {
 		ntrip_set_peeraddr(st, NULL, 0);
 		ntrip_set_localaddr(st);
 		ntrip_log(st, LOG_INFO, "Connected to %s:%d for %s", st->host, st->port, st->uri);
-		if (st->task && st->task->use_mimeq) {
-			st->state = NTRIP_IDLE_CLIENT;
-			ntrip_task_send_next_request(st);
-		} else
+		if (st->task && st->task->connect_cb)
+			st->task->connect_cb(st);
+		else
 			ntripcli_send_request(st, NULL, 0);
 		return;
 	} else if (events & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
 		if (events & BEV_EVENT_ERROR) {
+			if (errno == EINPROGRESS)
+				/* Ignore */
+				return;
 			ntrip_log(st, LOG_NOTICE, "Error: %s", strerror(errno));
 		} else {
 			ntrip_log(st, LOG_INFO, "Server EOF");
@@ -482,15 +484,16 @@ ntripcli_new(struct caster_state *caster, char *host, unsigned short port, int t
 		return NULL;
 	}
 	st->type = type;
-	st->task = task;
 	st->ssl = ssl;
 	st->client = 1;
 	st->own_livesource = livesource;
 	if (livesource)
 		livesource_incref(livesource);
 	st->persistent = persistent;
-	if (task)
+	if (task) {
+		st->task = task;
 		task->start = st->start;
+	}
 	return st;
 }
 

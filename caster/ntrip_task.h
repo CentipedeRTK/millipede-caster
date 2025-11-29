@@ -18,6 +18,8 @@ enum task_state {
  * Descriptor for a regularly scheduled outgoing connection task.
  */
 struct ntrip_task {
+	_Atomic u_int refcnt;
+
 	/* Host, port, whether to use TLS */
 	char *host;
 	unsigned short port;
@@ -33,6 +35,11 @@ struct ntrip_task {
 
 	/* How often to runs, in seconds. 0 = one shot. */
 	int refresh_delay;
+	int max_retry_delay;
+	int current_retry_delay;
+
+	// HTTP status timeout only used with mimeq/task_send_next_request()
+	int status_timeout;
 
 	struct caster_state *caster;
 
@@ -58,6 +65,8 @@ struct ntrip_task {
 	/* HTTP status callback, called as soon as it is received */
 	void (*status_cb)(void *arg, int status, int);
 	void *status_cb_arg;
+
+	void (*connect_cb)(struct ntrip_state *st);
 
 	/* Current ntrip_state, if any */
 	struct ntrip_state *st;
@@ -112,20 +121,22 @@ struct ntrip_task {
 };
 
 struct ntrip_task *ntrip_task_new(struct caster_state *caster,
-	const char *host, unsigned short port, const char *uri, int tls, int retry_delay,
+	const char *host, unsigned short port, const char *uri, int tls, int refresh_delay,
 	size_t bulk_max_size, size_t queue_max_size, const char *type, const char *drainfilename);
 void ntrip_task_ack_pending(struct ntrip_task *this);
-void ntrip_task_free(struct ntrip_task *this);
+void ntrip_task_incref(struct ntrip_task *this);
+void ntrip_task_decref(struct ntrip_task *this);
 struct ntrip_state *ntrip_task_clear_get_st(struct ntrip_task *this, int getref);
 void ntrip_task_clear_st(struct ntrip_task *this);
+enum task_state ntrip_task_get_state(struct ntrip_task *this);
 int ntrip_task_start(struct ntrip_task *this, void *reschedule_arg, struct livesource *livesource, int persistent);
 void ntrip_task_stop(struct ntrip_task *this);
 void ntrip_task_reschedule(struct ntrip_task *this, void *arg_cb);
-void ntrip_task_queue(struct ntrip_task *this, char *json);
+void ntrip_task_queue(struct ntrip_task *this, struct packet *packet);
 void ntrip_task_send_next_request(struct ntrip_state *st);
 
 void ntrip_task_reload(struct ntrip_task *this,
 	const char *host, unsigned short port, const char *uri, int tls,
-	int retry_delay, int bulk_max_size, int queue_max_size, const char *drainfilename);
+	int refresh_delay, int bulk_max_size, int queue_max_size, const char *drainfilename);
 
 #endif

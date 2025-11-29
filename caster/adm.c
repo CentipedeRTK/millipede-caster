@@ -22,6 +22,7 @@ int admsrv(struct ntrip_state *st, const char *method, const char *root_uri, con
 		*err = 503;
 		return -1;
 	}
+	req->st = st;
 
 	st->client_version = 0;		// force a straight HTTP reply regardless of client headers
 
@@ -89,6 +90,7 @@ int admsrv(struct ntrip_state *st, const char *method, const char *root_uri, con
 			{"/api/v1/net",	"GET", api_ntrip_list_json},
 			{"/api/v1/rtcm", "GET", api_rtcm_json},
 			{"/api/v1/mem","GET", api_mem_json},
+			{"/api/v1/nodes","GET", api_nodes_json},
 			{"/api/v1/livesources", "GET", livesource_list_json},
 			{"/api/v1/sourcetables", "GET", sourcetable_list_json},
 			{"/api/v1/reload", "POST", api_reload_json},

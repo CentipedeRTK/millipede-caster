@@ -12,6 +12,7 @@
 #include "log.h"
 #include "ntrip_common.h"
 #include "sourcetable.h"
+#include "util.h"
 
 static int _sourcetable_add_unlocked(struct sourcetable *this, const char *sourcetable_entry, int on_demand, struct caster_state *caster);
 
@@ -24,7 +25,7 @@ struct sourcetable *sourcetable_read(struct caster_state *caster, const char *fi
 	ssize_t linelen;
 	int nlines = 0;
 
-	FILE *fp = fopen(filename, "r");
+	FILE *fp = fopen_absolute(caster->config_dir, filename, "r");
 	if (fp == NULL) {
 		logfmt(&caster->flog, LOG_ERR, "Can't open %s", filename);
 		return NULL;
@@ -218,11 +219,8 @@ json_object *sourcetable_json(struct sourcetable *this) {
 	json_object_object_add_ex(jmain, "pullable", json_object_new_boolean(this->pullable), JSON_C_CONSTANT_NEW);
 	json_object_object_add_ex(jmain, "priority", json_object_new_int(this->priority), JSON_C_CONSTANT_NEW);
 
-	if (strcmp(this->caster, "LOCAL")) {
-		char iso_date[40];
-		iso_date_from_timeval(iso_date, sizeof iso_date, &this->fetch_time);
-		json_object_object_add_ex(jmain, "fetch_time", json_object_new_string(iso_date), JSON_C_CONSTANT_NEW);
-	}
+	if (strcmp(this->caster, "LOCAL"))
+		timeval_to_json(&this->fetch_time, jmain, "fetch_time");
 
 	json_object *jmnt = json_object_new_object();
 
@@ -599,7 +597,7 @@ static void _stack_replace(struct caster_state *caster, sourcetable_stack_t *sta
 		 * Insert at the right place to keep the stack sorted by decreasing priority.
 		 */
 		if (local)
-			logfmt(&caster->flog, LOG_INFO, "Reloading %s", caster->config->sourcetable_filename);
+			logfmt(&caster->flog, LOG_INFO, "Reloading %s", new_sourcetable->filename);
 		TAILQ_FOREACH(s, &stack->list, next) {
 			if (new_sourcetable->priority >= s->priority) {
 				TAILQ_INSERT_BEFORE(s, new_sourcetable, next);

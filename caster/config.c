@@ -60,8 +60,6 @@ static struct config default_config = {
 	.log = "/var/log/millipede/caster.log",
 	.log_level = LOG_INFO,
 	.admin_user = "admin",
-	.disable_zero_copy = 0,
-	.zero_copy = 1
 };
 
 static struct config_bind default_config_bind = {
@@ -82,7 +80,9 @@ static struct config_node default_config_node = {
 	.port = 2443,
 	.tls = 0,
 	.queue_max_size = 4000000,
-	.retry_delay = 30
+	.status_timeout = 20,
+	.retry_delay = 1,
+	.max_retry_delay = 60
 };
 
 static struct config_endpoint default_config_endpoint = {
@@ -92,7 +92,9 @@ static struct config_endpoint default_config_endpoint = {
 static struct config_graylog default_config_graylog = {
 	.bulk_max_size = 62000,
 	.queue_max_size = 4000000,
-	.retry_delay = 30,
+	.status_timeout = 20,
+	.retry_delay = 1,
+	.max_retry_delay = 60,
 	.port = 7777
 };
 
@@ -461,11 +463,6 @@ struct config *config_parse(const char *filename) {
 	DEFAULT_ASSIGN(this, http_header_max_size);
 	DEFAULT_ASSIGN(this, http_content_length_max);
 
-	// Undocumented
-	DEFAULT_ASSIGN(this, disable_zero_copy);
-
-	this->zero_copy = !this->disable_zero_copy;
-
 	for (int i = 0; i < this->proxy_count; i++) {
 		DEFAULT_ASSIGN_ARRAY(this, i, proxy, default_config_proxy, table_refresh_delay);
 		DEFAULT_ASSIGN_ARRAY(this, i, proxy, default_config_proxy, port);
@@ -527,6 +524,8 @@ struct config *config_parse(const char *filename) {
 	this->source_auth = NULL;
 	this->blocklist = NULL;
 	this->endpoints_json = _endpoints_json(this);
+	this->dyn = NULL;
+	this->free_callback = NULL;
 	return this;
 }
 
@@ -606,5 +605,7 @@ void config_free(struct config *this) {
 		prefix_table_free(this->blocklist);
 	if (this->endpoints_json)
 		json_object_put(this->endpoints_json);
+	if (this->free_callback)
+		this->free_callback(this);
 	free(this);
 }

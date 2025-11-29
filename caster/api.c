@@ -5,6 +5,7 @@
 
 #include "conf.h"
 #include "livesource.h"
+#include "nodes.h"
 #include "ntrip_common.h"
 #include "rtcm.h"
 #include "sourcetable.h"
@@ -71,9 +72,7 @@ static json_object *api_ntrip_json(struct ntrip_state *st) {
 		json_object_object_add_ex(new_obj, "tcp_info", tcpi_obj, JSON_C_CONSTANT_NEW);
 	}
 
-	char iso_date[30];
-	iso_date_from_timeval(iso_date, sizeof iso_date, &st->start);
-	json_object_object_add_ex(new_obj, "start", json_object_new_string(iso_date), JSON_C_CONSTANT_NEW);
+	timeval_to_json(&st->start, new_obj, "start");
 
 	bufferevent_unlock(st->bev);
 	return new_obj;
@@ -137,6 +136,17 @@ struct mime_content *api_mem_json(struct caster_state *caster, struct request *r
 }
 
 /*
+ * Return the node table.
+ */
+struct mime_content *api_nodes_json(struct caster_state *caster, struct request *req) {
+	struct json_object *jlist = nodes_json(caster->nodes);
+	char *s = mystrdup(json_object_to_json_string(jlist));
+	struct mime_content *m = mime_new(s, -1, "application/json", 1);
+	json_object_put(jlist);
+	return m;
+}
+
+/*
  * Reload the configuration and return a status code.
  */
 struct mime_content *api_reload_json(struct caster_state *caster, struct request *req) {
@@ -174,7 +184,7 @@ struct mime_content *api_sync_json(struct caster_state *caster, struct request *
 	} else if (!strcmp(type, "sourcetable")) {
 		req->status = sourcetable_update_execute(caster, req->json);
 	} else
-		req->status = livesource_update_execute(caster, caster->livesources, req->json);
+		req->status = livesource_update_execute(caster, caster->livesources, req);
 	char *s = mystrdup("");
 	struct mime_content *m = mime_new(s, -1, "application/json", 1);
 	return m;

@@ -1,5 +1,5 @@
-#ifndef _HASH_C
-#define _HASH_C
+#ifndef __HASH_H__
+#define __HASH_H__
 
 /*
  * Handle a key-value store
@@ -50,6 +50,7 @@ int hash_table_add(struct hash_table *this, const char *key, void *value);
 struct element *hash_table_get_element(struct hash_table *this, const char *key);
 void *hash_table_get(struct hash_table *this, const char *key);
 int hash_table_del(struct hash_table *this, const char *key);
+void *hash_table_get_del(struct hash_table *this, const char *key);
 int hash_table_incr(struct hash_table *this, const char *key);
 void hash_table_decr(struct hash_table *this, const char *key);
 int hash_len(struct hash_table *this);

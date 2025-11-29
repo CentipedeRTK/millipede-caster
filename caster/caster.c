@@ -51,9 +51,13 @@
 
 static void caster_log_cb(void *arg, struct gelf_entry *g, int level, const char *fmt, va_list ap);
 static void caster_alog(void *arg, struct gelf_entry *g, int level, const char *fmt, va_list ap);
-static int caster_reload_fetchers(struct caster_state *this);
-static void caster_free_fetchers(struct caster_state *this);
-static void caster_free_rtcm_filters(struct caster_state *caster);
+static int caster_reload_fetchers(struct caster_state *this, struct config *config,
+	struct caster_dynconfig *olddyn, struct caster_dynconfig *newdyn);
+static int caster_start_fetchers(struct caster_state *this, struct config *config, struct caster_dynconfig *newdyn);
+static void dynconfig_free_fetchers(struct caster_dynconfig *this);
+static void listener_free(struct listener *this);
+static void listener_incref(struct listener *this);
+static void listener_decref(struct listener *this);
 
 void caster_log_error(struct caster_state *this, char *orig) {
 	char s[256];
@@ -96,7 +100,7 @@ _caster_log(struct caster_state *caster, struct gelf_entry *g, struct log *log, 
 		json_object *j = gelf_json(g);
 		char *s = mystrdup(json_object_to_json_string(j));
 		json_object_put(j);
-		graylog_sender_queue(caster->graylog[0], s);
+		graylog_sender_queue(caster->config->dyn->graylog[0], s);
 		strfree(s);
 	}
 
@@ -132,6 +136,107 @@ caster_tls_log_cb(const char *str, size_t len, void *u) {
 	return 1;
 }
 
+static struct caster_dynconfig *dynconfig_new(struct caster_state *caster) {
+	struct caster_dynconfig *this = (struct caster_dynconfig *)malloc(sizeof(struct caster_dynconfig));
+	if (this == NULL)
+		return NULL;
+	this->listeners = NULL;
+	this->listeners_count = 0;
+	this->sourcetable_fetchers = NULL;
+	this->sourcetable_fetchers_count = 0;
+	this->graylog = NULL;
+	this->graylog_count = 0;
+	this->syncers = NULL;
+	this->syncers_count = 0;
+	this->rtcm_filter = NULL;
+	this->rtcm_filter_dict = NULL;
+	this->caster = caster;
+	return this;
+}
+
+static void dynconfig_free_fetchers(struct caster_dynconfig *this) {
+	struct sourcetable_fetch_args **a = this->sourcetable_fetchers;
+	if (!a)
+		return;
+	for (int i = 0; i < this->sourcetable_fetchers_count; i++) {
+		if (a[i]) {
+			logfmt(&this->caster->flog, LOG_INFO, "Stopping fetcher %s:%d", a[i]->task->host, a[i]->task->port);
+			fetcher_sourcetable_free(a[i]);
+		}
+	}
+	free(a);
+	this->sourcetable_fetchers = NULL;
+	this->sourcetable_fetchers_count = 0;
+}
+
+static void
+dynconfig_free_rtcm_filters(struct caster_dynconfig *dyn) {
+	if (dyn->rtcm_filter_dict) {
+		hash_table_free(dyn->rtcm_filter_dict);
+		dyn->rtcm_filter_dict = NULL;
+	}
+	if (dyn->rtcm_filter)
+		rtcm_filter_free(dyn->rtcm_filter);
+	dyn->rtcm_filter = NULL;
+}
+
+static void
+dynconfig_free_listeners(struct caster_dynconfig *dyn) {
+	if (dyn->listeners == NULL)
+		return;
+	for (int i = 0; i < dyn->listeners_count; i++)
+		listener_decref(dyn->listeners[i]);
+	free(dyn->listeners);
+	dyn->listeners = NULL;
+	dyn->listeners_count = 0;
+}
+
+static void
+dynconfig_free_graylog(struct caster_dynconfig *this) {
+	if (this->graylog == NULL)
+		return;
+	for (int i = 0; i < this->graylog_count; i++) {
+		if (this->graylog[i] != NULL) {
+			graylog_sender_free(this->graylog[i]);
+			this->graylog[i] = NULL;
+		}
+	}
+	free(this->graylog);
+	this->graylog = NULL;
+	this->graylog_count = 0;
+}
+
+static void
+dynconfig_free_syncers(struct caster_dynconfig *dyn) {
+	if (dyn->syncers == NULL)
+		return;
+	for (int i = 0; i < dyn->syncers_count; i++) {
+		if (dyn->syncers[i] != NULL) {
+			syncer_free(dyn->syncers[i]);
+			dyn->syncers[i] = NULL;
+		}
+	}
+	free(dyn->syncers);
+	dyn->syncers_count = 0;
+	dyn->syncers = NULL;
+}
+
+static void
+dynconfig_free(struct caster_dynconfig *this) {
+	dynconfig_free_listeners(this);
+	dynconfig_free_fetchers(this);
+	dynconfig_free_rtcm_filters(this);
+	dynconfig_free_syncers(this);
+	dynconfig_free_graylog(this);
+	free(this);
+}
+
+static void
+dynconfig_free_callback(struct config *config) {
+	dynconfig_free(config->dyn);
+	config->dyn = NULL;
+}
+
 static struct caster_state *
 caster_new(const char *config_file) {
 	int err = 0;
@@ -155,11 +260,6 @@ caster_new(const char *config_file) {
 		return NULL;
 	}
 
-	this->listeners = NULL;
-	this->listeners_count = 0;
-	this->sourcetable_fetchers = NULL;
-	this->sourcetable_fetchers_count = 0;
-
 	this->ssl_client_ctx = SSL_CTX_new(TLS_client_method());
 	if (this->ssl_client_ctx == NULL) {
 		ERR_print_errors_cb(caster_tls_log_cb, this);
@@ -173,6 +273,7 @@ caster_new(const char *config_file) {
 
 	gethostname(this->hostname, sizeof(this->hostname));
 	this->livesources = livesource_table_new(this->hostname, &this->start_date);
+	this->nodes = nodes_new();
 
 	P_RWLOCK_INIT(&this->ntrips.lock, NULL);
 	P_RWLOCK_INIT(&this->ntrips.free_lock, NULL);
@@ -182,24 +283,26 @@ caster_new(const char *config_file) {
 	P_RWLOCK_INIT(&this->quotalock, NULL);
 	this->ntrips.ipcount = hash_table_new(509, NULL);
 
-	// Used for access to source_auth, host_auth, blocklist and listener config
-	pthread_mutexattr_t attr;
-	pthread_mutexattr_init(&attr);
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-	P_MUTEX_INIT(&this->configmtx, &attr);
-	pthread_mutexattr_destroy(&attr);
+	// Used for access to config and reload serializing
+	P_RWLOCK_INIT(&this->configlock, NULL);
+	P_MUTEX_INIT(&this->configreload, NULL);
 
 	P_RWLOCK_INIT(&this->sourcetablestack.lock, NULL);
 
 	atomic_init(&this->config, NULL);
-	this->config_file = config_file;
 
 	char *abs_config_path = realpath(config_file, NULL);
 	if (abs_config_path == NULL) {
 		fprintf(stderr, "Error: can't determine absolute path for config file %s\n", config_file);
 		err = 1;
 		this->config_dir = NULL;
+		this->config_file = mystrdup(config_file);
+		if (this->config_file == NULL)
+			err = 1;
 	} else {
+		this->config_file = mystrdup(abs_config_path);
+		if (this->config_file == NULL)
+			err = 1;
 		char *last_slash = strrchr(abs_config_path, '/');
 		if (last_slash) {
 			if (last_slash == abs_config_path)
@@ -211,33 +314,22 @@ caster_new(const char *config_file) {
 			this->config_dir = mystrdup(".");
 	}
 
-	int current_dir = open(".", O_DIRECTORY);
-	if (this->config_dir) chdir(this->config_dir);
-
 	this->joblist = threads ? joblist_new(this) : NULL;
 
 	int r1 = log_init(&this->flog, NULL, &caster_log_cb, this);
 	int r2 = log_init(&this->alog, NULL, &caster_alog, this);
 
-	this->graylog = NULL;
-	this->graylog_count = 0;
-	this->syncers = NULL;
-	this->syncers_count = 0;
-	this->rtcm_filter = NULL;
-	this->rtcm_filter_dict = NULL;
-
-	fchdir(current_dir);
-	close(current_dir);
-
 	if (err || r1 < 0 || r2 < 0 || !this->config_dir
 	    || (threads && this->joblist == NULL)
 	    || this->ntrips.ipcount == NULL
-	    || this->livesources == NULL) {
+	    || this->livesources == NULL
+		|| this->nodes == NULL) {
 		if (this->joblist) joblist_free(this->joblist);
 		if (r1 < 0) log_free(&this->flog);
 		if (r2 < 0) log_free(&this->alog);
 		if (this->ntrips.ipcount) hash_table_free(this->ntrips.ipcount);
 		if (this->livesources) livesource_table_free(this->livesources);
+		if (this->nodes) nodes_free(this->nodes);
 		strfree(this->config_dir);
 		free(this);
 		return NULL;
@@ -255,114 +347,118 @@ caster_new(const char *config_file) {
 	return this;
 }
 
-static void caster_free_listener(struct listener *this) {
-	if (this->listener)
-		evconnlistener_free(this->listener);
-	if (this->tls && this->ssl_server_ctx)
-		SSL_CTX_free(this->ssl_server_ctx);
-	free(this);
-}
-
-static void caster_free_listeners(struct caster_state *this) {
-	for (int i = 0; i < this->listeners_count; i++)
-		caster_free_listener(this->listeners[i]);
-	free(this->listeners);
-	this->listeners = NULL;
-	this->listeners_count = 0;
-}
-
-static int caster_start_syncers(struct caster_state *this) {
-	if (this->config->node_count == 0) {
-		this->syncers_count = 0;
+static int caster_reload_syncers(struct caster_state *this, struct config *config, struct caster_dynconfig *olddyn, struct caster_dynconfig *newdyn) {
+	if (config->node_count == 0) {
+		newdyn->syncers = NULL;
+		newdyn->syncers_count = 0;
 		return 0;
 	}
-	this->syncers_count = 1;
-	this->syncers = (struct syncer **)malloc(sizeof(struct syncer *)*this->syncers_count);
-	for (int i = 0; i < this->syncers_count; i++) {
-		this->syncers[i] = syncer_new(this,
-			this->config->node, this->config->node_count, "/adm/api/v1/sync", 0);
-		for (int j = 0; j < this->config->node_count; j++)
-			syncer_start(this->syncers[i], j);
+	newdyn->syncers_count = 1;
+	newdyn->syncers = (struct syncer **)calloc(sizeof(struct syncer *)*newdyn->syncers_count, 1);
+	if (newdyn->syncers == NULL)
+		return -1;
+
+	if (olddyn != NULL && olddyn->syncers != NULL && olddyn->syncers_count == newdyn->syncers_count) {
+		newdyn->syncers_count = olddyn->syncers_count;
+		for (int i = 0; i < newdyn->syncers_count; i++) {
+			newdyn->syncers[i] = olddyn->syncers[i];
+			olddyn->syncers[i] = NULL;
+		}
+	} else {
+		for (int i = 0; i < newdyn->syncers_count; i++) {
+			newdyn->syncers[i] = syncer_new(this, config->node, config->node_count, "/adm/api/v1/sync", 0);
+			if (newdyn->syncers[i] == NULL) {
+				for (int j = 0; j < i; j++)
+					syncer_free(newdyn->syncers[i]);
+				free(newdyn->syncers);
+				return -1;
+			}
+		}
 	}
+
+	for (int i = 0; i < newdyn->syncers_count; i++)
+		syncer_reload(newdyn->syncers[i], config->node, config->node_count, "/adm/api/v1/sync", 0);
 	return 0;
 }
 
-static void caster_free_syncers(struct caster_state *this) {
-	if (this->syncers == NULL)
-		return;
-	for (int i = 0; i < this->syncers_count; i++)
-		syncer_free(this->syncers[i]);
-	free(this->syncers);
-	this->syncers_count = 0;
-	this->syncers = NULL;
+static int caster_start_syncers(struct caster_state *this, struct config *config, struct caster_dynconfig *dyn) {
+	for (int i = 0; i < dyn->syncers_count; i++)
+		syncer_start_all(dyn->syncers[i]);
+	return 0;
 }
 
-static int caster_reload_syncers(struct caster_state *this) {
-	caster_free_syncers(this);
-	return caster_start_syncers(this);
-}
-
-static void caster_free_graylog(struct caster_state *this) {
-	this->graylog_log_level = -1;
-	for (int i = 0; i < this->graylog_count; i++)
-		graylog_sender_free(this->graylog[i]);
-	free(this->graylog);
-	this->graylog = NULL;
-	this->graylog_count = 0;
-}
-
-static int caster_reload_graylog(struct caster_state *this) {
+static int caster_reload_graylog(struct caster_state *this, struct config *config, struct caster_dynconfig *dyn) {
 	int r = 0;
 	int i;
 
-	/* The log system is currently hardocoded for graylog_count == 0 or 1 */
+	/* The log system is currently hardcoded for graylog_count == 0 or 1 */
 
 	struct graylog_sender **new_graylog = NULL;
 
-	if (this->config->graylog_count) {
-		new_graylog = (struct graylog_sender **)malloc(sizeof(struct graylog_sender *)*this->config->graylog_count);
+	if (config->graylog_count) {
+		new_graylog = (struct graylog_sender **)malloc(sizeof(struct graylog_sender *)*config->graylog_count);
 		if (new_graylog == NULL)
 			return -1;
 	}
 
-	for (i = 0; i < this->config->graylog_count; i++) {
+	for (i = 0; i < config->graylog_count; i++)
+		new_graylog[i] = NULL;
+
+	for (i = 0; i < config->graylog_count; i++) {
 		new_graylog[i] = graylog_sender_new(this,
-			this->config->graylog[i].host,
-			this->config->graylog[i].port,
-			this->config->graylog[i].uri,
-			this->config->graylog[i].tls,
-			this->config->graylog[i].retry_delay,
-			this->config->graylog[i].bulk_max_size,
-			this->config->graylog[i].queue_max_size,
-			this->config->graylog[i].authorization,
-			this->config->graylog[i].drainfilename);
+			config->graylog[i].host,
+			config->graylog[i].port,
+			config->graylog[i].uri,
+			config->graylog[i].tls,
+			config->graylog[i].status_timeout,
+			config->graylog[i].retry_delay,
+			config->graylog[i].max_retry_delay,
+			config->graylog[i].bulk_max_size,
+			config->graylog[i].queue_max_size,
+			config->graylog[i].authorization,
+			config->graylog[i].drainfilename);
 		if (!new_graylog[i]) {
 			r = -1;
 			break;
 		}
-		graylog_sender_start(new_graylog[i], 0);
 	}
 	if (r == -1) {
-		for (int j = 0; i < j; j++)
-			graylog_sender_free(new_graylog[j]);
+		for (i = 0; i < config->graylog_count; i++)
+			if (new_graylog[i] != NULL)
+				graylog_sender_free(new_graylog[i]);
 		free(new_graylog);
 	} else {
-		caster_free_graylog(this);
-		this->graylog = new_graylog;
-		this->graylog_count = this->config->graylog_count;
+		dyn->graylog = new_graylog;
+		dyn->graylog_count = config->graylog_count;
 	}
 	return r;
 }
 
+static int caster_start_graylog(struct caster_state *this, struct config *config, struct caster_dynconfig *dyn) {
+	for (int i = 0; i < dyn->graylog_count; i++)
+		graylog_sender_start(dyn->graylog[i], 0);
+	return 0;
+}
+
 void caster_free(struct caster_state *this) {
-	/* Kill all connections */
+	if (this->config) {
+		/* Stop accepting incoming connections */
+		dynconfig_free_listeners(this->config->dyn);
+
+		/* Stop outgoing connections */
+		dynconfig_free_fetchers(this->config->dyn);
+		dynconfig_free_syncers(this->config->dyn);
+
+		this->graylog_log_level = -1;
+		dynconfig_free_graylog(this->config->dyn);
+	}
+
+	/* Kill all remaining connections */
 	ntrip_drop_by_id(this, 0);
 
 	/* Wait for the threads to finish their tasks */
 	if (threads)
 		jobs_stop_threads(this->joblist);
-
-	caster_free_listeners(this);
 
 	if (this->signalhup_event)
 		event_free(this->signalhup_event);
@@ -371,12 +467,9 @@ void caster_free(struct caster_state *this) {
 	if (this->signalterm_event)
 		event_free(this->signalterm_event);
 
-	caster_free_fetchers(this);
-	caster_free_syncers(this);
-	caster_free_graylog(this);
-
 	if (this->joblist) joblist_free(this->joblist);
 	livesource_table_free(this->livesources);
+	nodes_free(this->nodes);
 
 	hash_table_free(this->ntrips.ipcount);
 	hash_table_free(this->rtcm_cache);
@@ -398,13 +491,14 @@ void caster_free(struct caster_state *this) {
 	P_RWLOCK_DESTROY(&this->rtcm_lock);
 	P_RWLOCK_DESTROY(&this->ntrips.lock);
 	P_RWLOCK_DESTROY(&this->ntrips.free_lock);
-	P_MUTEX_DESTROY(&this->configmtx);
+	P_RWLOCK_DESTROY(&this->configlock);
+	P_MUTEX_DESTROY(&this->configreload);
 	log_free(&this->flog);
 	log_free(&this->alog);
 	strfree(this->config_dir);
+	strfree((char *)this->config_file);
 	if (this->config)
 		config_decref(this->config);
-	caster_free_rtcm_filters(this);
 	libevent_global_shutdown();
 	free(this);
 }
@@ -413,10 +507,19 @@ void caster_free(struct caster_state *this) {
  * Load TLS certificates from file paths.
  */
 static int listener_load_certs(struct listener *this, const char *tls_full_certificate_chain, const char *tls_private_key) {
-	if (SSL_CTX_use_certificate_chain_file(this->ssl_server_ctx, tls_full_certificate_chain) <= 0)
+	char *full_certificate_chain = joinpath(this->caster->config_dir, tls_full_certificate_chain);
+	char *private_key = joinpath(this->caster->config_dir, tls_private_key);
+
+	if (full_certificate_chain == NULL || private_key == NULL
+		|| SSL_CTX_use_certificate_chain_file(this->ssl_server_ctx, full_certificate_chain) <= 0
+		|| SSL_CTX_use_PrivateKey_file(this->ssl_server_ctx, private_key, SSL_FILETYPE_PEM) <= 0) {
+		strfree(private_key);
+		strfree(full_certificate_chain);
 		return -1;
-	if (SSL_CTX_use_PrivateKey_file(this->ssl_server_ctx, tls_private_key, SSL_FILETYPE_PEM) <= 0)
-		return -1;
+	}
+	strfree(private_key);
+	strfree(full_certificate_chain);
+
 	if (!SSL_CTX_check_private_key(this->ssl_server_ctx)) {
 		char ip[64];
 		logfmt(&this->caster->flog, LOG_ERR, "Private key for %s does not match the certificate public key", ip_str_port(&this->sockaddr, ip, sizeof ip));
@@ -465,18 +568,24 @@ static int listener_setup_tls(struct listener *this, struct config_bind *config)
 /*
  * Configure a listening port for libevent.
  */
-static int caster_start_listener(struct caster_state *this, struct config_bind *config, union sock *sin, struct listener *listener) {
-	listener->listener = NULL;
+static struct listener *listener_new(struct caster_state *this, struct config_bind *config, union sock *sin) {
+	struct listener *listener = (struct listener *)malloc(sizeof(struct listener));
+
+	if (listener == NULL)
+		return NULL;
+
 	listener->sockaddr = *sin;
 	listener->caster = this;
-	int tls = config->tls;
-	listener->tls = tls;
+	listener->tls = config->tls;
 	listener->ssl_server_ctx = NULL;
 	listener->hostname = NULL;
+	atomic_init(&listener->refcnt, 1);
 
 	if (config->tls && config->tls_full_certificate_chain && config->tls_private_key) {
-		if (listener_setup_tls(listener, config) < 0)
-			return -1;
+		if (listener_setup_tls(listener, config) < 0) {
+			free(listener);
+			return NULL;
+		}
 	}
 
 	listener->listener = evconnlistener_new_bind(this->base, ntripsrv_listener_cb, listener,
@@ -484,36 +593,52 @@ static int caster_start_listener(struct caster_state *this, struct config_bind *
 		(struct sockaddr *)sin, sin->generic.sa_family == AF_INET ? sizeof(sin->v4) : sizeof(sin->v6));
 	if (!listener->listener) {
 		logfmt(&this->flog, LOG_ERR, "Could not create a listener for %s:%d!", config->ip, config->port);
-		return -1;
+		free(listener);
+		return NULL;
 	}
-	return 0;
+	return listener;
+}
+
+static void listener_free(struct listener *this) {
+	char ip[64];
+	logfmt(&this->caster->flog, LOG_INFO, "Closing listener %s", ip_str_port(&this->sockaddr, ip, sizeof ip));
+	if (this->listener)
+		evconnlistener_free(this->listener);
+	if (this->tls && this->ssl_server_ctx)
+		SSL_CTX_free(this->ssl_server_ctx);
+	free(this);
+}
+
+static void listener_incref(struct listener *this) {
+	atomic_fetch_add(&this->refcnt, 1);
+}
+
+static void listener_decref(struct listener *this) {
+	if (atomic_fetch_add_explicit(&this->refcnt, -1, memory_order_relaxed) == 1)
+		listener_free(this);
 }
 
 /*
  * Configure/reconfigure listening ports, reusing already existing sockets if possible.
  */
-static int caster_reload_listeners(struct caster_state *this) {
+static int caster_reload_listeners(struct caster_state *this,
+	struct config *new_config,
+	struct caster_dynconfig *olddyn,
+	struct caster_dynconfig *newdyn) {
 	union sock sin;
 	unsigned short port;
 	int r, i;
 	struct listener **new_listeners;
 	char ip[64];
 
-	P_MUTEX_LOCK(&this->configmtx);
-	if (this->config->bind_count == 0) {
+	if (new_config->bind_count == 0) {
 		logfmt(&this->flog, LOG_CRIT, "No configured ports to listen to, aborting.");
-		if (this->listeners)
-			caster_free_listeners(this);
-		P_MUTEX_UNLOCK(&this->configmtx);
 		return -1;
 	}
 
-	new_listeners = (struct listener **)malloc(sizeof(struct listener *)*this->config->bind_count);
+	new_listeners = (struct listener **)malloc(sizeof(struct listener *)*new_config->bind_count);
 	if (!new_listeners) {
 		logfmt(&this->flog, LOG_CRIT, "Can't allocate listeners");
-		if (this->listeners)
-			caster_free_listeners(this);
-		P_MUTEX_UNLOCK(&this->configmtx);
 		return -1;
 	}
 
@@ -521,17 +646,15 @@ static int caster_reload_listeners(struct caster_state *this) {
 	 * Create listening socket addresses.
 	 * Create a libevent listener for each.
 	 */
-	int current_dir = open(".", O_DIRECTORY);
-	chdir(this->config_dir);
 
 	int nlisteners = 0;
 
-	for (i = 0; i < this->config->bind_count; i++) {
-		struct config_bind *config = this->config->bind + i;
+	for (i = 0; i < new_config->bind_count; i++) {
+		struct config_bind *config = new_config->bind + i;
 		port = htons(config->port);
 		r = ip_convert(config->ip, &sin);
-		if (!r) {
-			logfmt(&this->flog, LOG_ERR, "Invalid IP %s", this->config->bind[i].ip);
+		if (r <= 0) {
+			logfmt(&this->flog, LOG_ERR, "Invalid IP %s", new_config->bind[i].ip);
 			continue;
 		}
 		if (sin.generic.sa_family == AF_INET)
@@ -544,15 +667,17 @@ static int caster_reload_listeners(struct caster_state *this) {
 		 */
 		struct listener *recycled_listener = NULL;
 		int j;
-		for (j = 0; j < this->listeners_count; j++) {
-			if (this->listeners[j] && !ip_cmp(&sin, &this->listeners[j]->sockaddr)) {
-				recycled_listener = this->listeners[j];
-				break;
-			}
-		}
+		if (olddyn)
+			for (j = 0; j < olddyn->listeners_count; j++)
+				if (olddyn->listeners[j] && !ip_cmp(&sin, &olddyn->listeners[j]->sockaddr)) {
+					recycled_listener = olddyn->listeners[j];
+					listener_incref(recycled_listener);
+					break;
+				}
 		if (recycled_listener) {
 			if (config->tls && listener_setup_tls(recycled_listener, config) < 0) {
 				logfmt(&this->flog, LOG_ERR, "Can't reuse listener %s: TLS setup failed", ip_str_port(&sin, ip, sizeof ip));
+				listener_decref(recycled_listener);
 				recycled_listener = NULL;
 			} else {
 				if (recycled_listener->tls && !config->tls) {
@@ -561,54 +686,36 @@ static int caster_reload_listeners(struct caster_state *this) {
 				}
 				logfmt(&this->flog, LOG_INFO, "Reusing listener %s", ip_str_port(&sin, ip, sizeof ip));
 				new_listeners[nlisteners++] = recycled_listener;
-				this->listeners[j] = NULL;
 			}
 		}
 		if (!recycled_listener) {
 			/*
 			 * No reusable listener found, or reuse failed, start a new listener instance.
 			 */
-			struct listener *new_listener = (struct listener *)malloc(sizeof(struct listener));
-			if (new_listener) {
-				if (caster_start_listener(this, this->config->bind+i, &sin, new_listener) >= 0) {
-					new_listeners[nlisteners++] = new_listener;
-					logfmt(&this->flog, LOG_INFO, "Opening listener %s", ip_str_port(&sin, ip, sizeof ip));
-				} else {
-					logfmt(&this->flog, LOG_ERR, "Unable to open listener %s", ip_str_port(&sin, ip, sizeof ip));
-					caster_free_listener(new_listener);
-				}
+			struct listener *new_listener = listener_new(this, new_config->bind+i, &sin);
+			if (new_listener != NULL) {
+				new_listeners[nlisteners++] = new_listener;
+				logfmt(&this->flog, LOG_INFO, "Opening listener %s", ip_str_port(&sin, ip, sizeof ip));
+			} else {
+				logfmt(&this->flog, LOG_ERR, "Unable to open listener %s", ip_str_port(&sin, ip, sizeof ip));
 			}
 		}
 	}
-	fchdir(current_dir);
-	close(current_dir);
 
-	/*
-	 * Drop remaining listening sockets we haven't reused.
-	 */
-	for (int j = 0; j < this->listeners_count; j++)
-		if (this->listeners[j]) {
-			logfmt(&this->flog, LOG_INFO, "Closing listener %s", ip_str_port(&this->listeners[j]->sockaddr, ip, sizeof ip));
-			caster_free_listener(this->listeners[j]);
-		}
-
-	free(this->listeners);
-	this->listeners = new_listeners;
-	this->listeners_count = nlisteners;
-
-	P_MUTEX_UNLOCK(&this->configmtx);
-
-	if (this->listeners_count == 0) {
+	if (nlisteners == 0) {
 		logfmt(&this->flog, LOG_CRIT, "No configured ports to listen to, aborting.");
 		return -1;
 	}
+
+	newdyn->listeners = new_listeners;
+	newdyn->listeners_count = nlisteners;
 	return 0;
 }
 
 static int
-caster_reload_sourcetables(struct caster_state *caster) {
+caster_reload_sourcetables(struct caster_state *caster, struct config *config) {
 	struct sourcetable *local_table
-		= sourcetable_read(caster, caster->config->sourcetable_filename, caster->config->sourcetable_priority);
+		= sourcetable_read(caster, config->sourcetable_filename, config->sourcetable_priority);
 
 	if (local_table == NULL)
 		return -1;
@@ -618,31 +725,35 @@ caster_reload_sourcetables(struct caster_state *caster) {
 }
 
 static int
-caster_reopen_logs(struct caster_state *this) {
+caster_reopen_logs(struct caster_state *this, struct config *config) {
 	int r = 0;
-	if (log_reopen(&this->flog, this->config->log) < 0)
+	char *config_log = joinpath(this->config_dir, config->log);
+	char *access_log = joinpath(this->config_dir, config->access_log);
+	if (config_log == NULL || log_reopen(&this->flog, config_log) < 0)
 		r = -1;
-	if (log_reopen(&this->alog, this->config->access_log) < 0)
+	if (access_log == NULL || log_reopen(&this->alog, access_log) < 0)
 		r = -1;
+	strfree(config_log);
+	strfree(access_log);
 	return r;
 }
 
 static int
-caster_reload_auth(struct caster_state *caster) {
+caster_reload_auth(struct caster_state *caster, struct config *config) {
 	int r = 0;
-	logfmt(&caster->flog, LOG_INFO, "Reloading %s and %s", caster->config->host_auth_filename, caster->config->source_auth_filename);
+	logfmt(&caster->flog, LOG_INFO, "Reloading %s and %s", config->host_auth_filename, config->source_auth_filename);
 
-	if (caster->config->host_auth_filename) {
-		struct auth_entry *tmp = auth_parse(caster, caster->config->host_auth_filename);
+	if (config->host_auth_filename) {
+		struct auth_entry *tmp = auth_parse(caster, config->host_auth_filename);
 		if (tmp != NULL) {
-			caster->config->host_auth = tmp;
+			config->host_auth = tmp;
 		} else
 			r = -1;
 	}
-	if (caster->config->source_auth_filename) {
-		struct auth_entry *tmp = auth_parse(caster, caster->config->source_auth_filename);
+	if (config->source_auth_filename) {
+		struct auth_entry *tmp = auth_parse(caster, config->source_auth_filename);
 		if (tmp != NULL) {
-			caster->config->source_auth = tmp;
+			config->source_auth = tmp;
 		} else
 			r = -1;
 	}
@@ -650,114 +761,74 @@ caster_reload_auth(struct caster_state *caster) {
 }
 
 static int
-caster_reload_blocklist(struct caster_state *caster) {
+caster_reload_blocklist(struct caster_state *caster, struct config *config) {
 	int r = 0;
 	struct prefix_table *p;
 
-	if (caster->config->blocklist_filename) {
-		logfmt(&caster->flog, LOG_INFO, "Reloading %s", caster->config->blocklist_filename);
+	if (config->blocklist_filename) {
+		logfmt(&caster->flog, LOG_INFO, "Reloading %s", config->blocklist_filename);
 		p = prefix_table_new();
 		if (p == NULL)
 			r = -1;
-		else if (prefix_table_read(p, caster->config->blocklist_filename, &caster->flog) < 0) {
+		else if (prefix_table_read(p, caster->config_dir, config->blocklist_filename, &caster->flog) < 0) {
 			prefix_table_free(p);
 			p = NULL;
 			r = -1;
 		}
-		caster->config->blocklist = p;
+		config->blocklist = p;
 	}
 	return r;
 }
 
-static void
-caster_free_rtcm_filters(struct caster_state *caster) {
-	if (caster->rtcm_filter_dict) {
-		hash_table_free(caster->rtcm_filter_dict);
-		caster->rtcm_filter_dict = NULL;
-	}
-	if (caster->rtcm_filter)
-		rtcm_filter_free(caster->rtcm_filter);
-	caster->rtcm_filter = NULL;
-}
-
 static int
-caster_reload_rtcm_filters(struct caster_state *caster) {
-	if (caster->config->rtcm_filter_count == 0) {
-		caster_free_rtcm_filters(caster);
+caster_reload_rtcm_filters(struct caster_state *caster, struct config *config, struct caster_dynconfig *newdyn) {
+	if (config->rtcm_filter_count == 0)
 		return 0;
-	}
-	if (caster->config->rtcm_filter_count != 1) {
-		caster_free_rtcm_filters(caster);
-		return -1;
-	}
-
-	if (caster->rtcm_filter_dict)
-		hash_table_free(caster->rtcm_filter_dict);
-	caster->rtcm_filter_dict = hash_table_new(5, NULL);
-	if (caster->rtcm_filter_dict == NULL)
+	if (config->rtcm_filter_count != 1)
 		return -1;
 
-	for (int i = 0; i < caster->config->rtcm_filter_count; i++) {
+	if (newdyn->rtcm_filter_dict)
+		hash_table_free(newdyn->rtcm_filter_dict);
+	newdyn->rtcm_filter_dict = hash_table_new(5, NULL);
+	if (newdyn->rtcm_filter_dict == NULL)
+		return -1;
+
+	for (int i = 0; i < config->rtcm_filter_count; i++) {
 		struct rtcm_filter *rtcm_filter;
 		rtcm_filter = rtcm_filter_new(
-			caster->config->rtcm_filter[i].pass,
-			caster->config->rtcm_filter[i].convert_count ? caster->config->rtcm_filter[i].convert[0].types : NULL,
-			caster->config->rtcm_filter[i].convert_count ? caster->config->rtcm_filter[i].convert[0].conversion : 0
+			config->rtcm_filter[i].pass,
+			config->rtcm_filter[i].convert_count ? config->rtcm_filter[i].convert[0].types : NULL,
+			config->rtcm_filter[i].convert_count ? config->rtcm_filter[i].convert[0].conversion : 0
 		);
 		if (rtcm_filter == NULL) {
 			logfmt(&caster->flog, LOG_ERR, "Can't parse rtcm_filter configuration from %s", caster->config_file);
 			return -1;
 		}
-		struct hash_table *h = rtcm_filter_dict_parse(rtcm_filter, caster->config->rtcm_filter[i].apply);
+		struct hash_table *h = rtcm_filter_dict_parse(rtcm_filter, config->rtcm_filter[i].apply);
 		if (h == NULL) {
 			logfmt(&caster->flog, LOG_ERR, "Can't parse rtcm_filter configuration from %s", caster->config_file);
 			rtcm_filter_free(rtcm_filter);
 			return -1;
 		}
-		hash_table_update(caster->rtcm_filter_dict, h);
+		hash_table_update(newdyn->rtcm_filter_dict, h);
 		hash_table_free(h);
-		if (caster->rtcm_filter)
-			rtcm_filter_free(caster->rtcm_filter);
-		caster->rtcm_filter = rtcm_filter;
+		if (newdyn->rtcm_filter)
+			rtcm_filter_free(newdyn->rtcm_filter);
+		newdyn->rtcm_filter = rtcm_filter;
 	}
 	return 0;
 }
 
-static int caster_reload_config(struct caster_state *this) {
+static struct config *caster_load_config(struct caster_state *this) {
 	struct config *config;
 	if (!(config = config_parse(this->config_file))) {
 		if (this->config)
 			logfmt(&this->flog, LOG_ERR, "Can't parse configuration from %s", this->config_file);
 		else
 			fprintf(stderr, "Can't parse configuration from %s\n", this->config_file);
-		return -1;
+		return NULL;
 	}
-	if (atomic_load(&this->config))
-		config_decref(atomic_load(&this->config));
-	atomic_store(&this->config, config);
-	return 0;
-}
-
-/*
- * reload with chdir to allow relative paths in the configuration.
- */
-static int caster_chdir_reload(struct caster_state *this, int reopen_logs) {
-	int r = 0;
-	int current_dir = open(".", O_DIRECTORY);
-	chdir(this->config_dir);
-	if (reopen_logs && caster_reopen_logs(this) < 0)
-		r = -1;
-	if (caster_reload_sourcetables(this) < 0)
-		r = -1;
-	if (caster_reload_auth(this) < 0)
-		r = -1;
-	if (caster_reload_blocklist(this) < 0)
-		r = -1;
-	if (caster_reload_rtcm_filters(this) < 0)
-		r = -1;
-	fchdir(current_dir);
-	close(current_dir);
-	return r;
+	return config;
 }
 
 static void
@@ -770,33 +841,98 @@ signal_cb(evutil_socket_t sig, short events, void *user_data) {
 	event_base_loopexit(info->caster->base, &delay);
 }
 
-int caster_reload(struct caster_state *this) {
+static int caster_start(struct caster_state *this, struct config *config, int lock) {
 	int r = 0;
-	P_MUTEX_LOCK(&this->configmtx);
-	this->graylog_log_level = -1;
-	if (caster_reload_config(this) < 0) {
+	if (lock)
+		P_MUTEX_LOCK(&this->configreload);
+
+	if (caster_start_fetchers(this, config, config->dyn) < 0)
 		r = -1;
-		if (this->config == NULL) {
+	if (caster_start_syncers(this, config, config->dyn) < 0)
+		r = -1;
+	if (caster_start_graylog(this, config, config->dyn) < 0)
+		r = -1;
+	else
+		this->graylog_log_level = config->graylog_count > 0 ? config->graylog[0].log_level : -1;
+
+	if (lock)
+		P_MUTEX_UNLOCK(&this->configreload);
+	return r;
+}
+
+static int caster_load(struct caster_state *this, int restart) {
+	struct config *config, *old_config;
+	struct caster_dynconfig *olddyn;
+
+	int r = 0;
+
+	struct caster_dynconfig *newdyn = dynconfig_new(this);
+	if (newdyn == NULL)
+		return -1;
+
+	config = caster_load_config(this);
+
+	P_MUTEX_LOCK(&this->configreload);
+
+	this->graylog_log_level = -1;
+	old_config = atomic_load(&this->config);
+	if (config == NULL) {
+		r = -1;
+		if (old_config == NULL) {
 			// Incorrect new config and no former config:
 			// abort all because we can't log more errors anyway.
-			P_MUTEX_UNLOCK(&this->configmtx);
+			P_MUTEX_UNLOCK(&this->configreload);
+			dynconfig_free(newdyn);
 			return -1;
 		}
+		/* Keep the former config */
+		config = old_config;
+		old_config = NULL;
 	}
-	this->log_level = this->config->log_level;
-	if (caster_chdir_reload(this, 1) < 0)
+	config->dyn = newdyn;
+	config->free_callback = dynconfig_free_callback;
+	olddyn = old_config?old_config->dyn:NULL;
+
+	P_RWLOCK_WRLOCK(&this->configlock);
+	atomic_store(&this->config, config);
+	P_RWLOCK_UNLOCK(&this->configlock);
+
+	this->log_level = config->log_level;
+	if (caster_reopen_logs(this, config) < 0)
 		r = -1;
-	if (caster_reload_graylog(this) < 0)
+	if (caster_reload_sourcetables(this, config) < 0)
 		r = -1;
-	this->graylog_log_level = this->config->graylog_count > 0 ? this->config->graylog[0].log_level : -1;
-	if (caster_reload_listeners(this) < 0)
+	if (caster_reload_auth(this, config) < 0)
 		r = -1;
-	if (caster_reload_fetchers(this) < 0)
+	if (caster_reload_blocklist(this, config) < 0)
 		r = -1;
-	if (caster_reload_syncers(this) < 0)
+	if (caster_reload_rtcm_filters(this, config, newdyn) < 0)
 		r = -1;
-	P_MUTEX_UNLOCK(&this->configmtx);
+	if (caster_reload_graylog(this, config, newdyn) < 0)
+		r = -1;
+	if (caster_reload_listeners(this, config, olddyn, newdyn) < 0)
+		r = -1;
+	if (caster_reload_fetchers(this, config, olddyn, newdyn) < 0)
+		r = -1;
+	if (caster_reload_syncers(this, config, olddyn, newdyn) < 0)
+		r = -1;
+	if (olddyn != NULL) {
+		dynconfig_free_fetchers(olddyn);
+		dynconfig_free_graylog(olddyn);
+	}
+
+	if (old_config)
+		config_decref(old_config);
+
+	if (restart && caster_start(this, config, 0) < 0)
+		r = -1;
+
+	P_MUTEX_UNLOCK(&this->configreload);
 	return r;
+}
+
+int caster_reload(struct caster_state *this) {
+	return caster_load(this, 1);
 }
 
 static void
@@ -844,10 +980,11 @@ static int caster_set_signals(struct caster_state *this) {
 }
 
 /*
- * Start/reload sourcetable fetchers (proxy)
+ * Reload sourcetable fetchers
  */
-static int caster_reload_fetchers(struct caster_state *this) {
-	struct config *config = this->config;
+static int caster_reload_fetchers(struct caster_state *this, struct config *config,
+	struct caster_dynconfig *olddyn,
+	struct caster_dynconfig *newdyn) {
 	int r = 0;
 	struct sourcetable_fetch_args **new_fetchers;
 	if (config->proxy_count)
@@ -860,18 +997,19 @@ static int caster_reload_fetchers(struct caster_state *this) {
 	 */
 	for (int i = 0; i < config->proxy_count; i++) {
 		struct sourcetable_fetch_args *p = NULL;
-		for (int j = 0; j < this->sourcetable_fetchers_count; j++) {
-			if (this->sourcetable_fetchers[j] == NULL)
-				/* Already cleared */
-				continue;
-			if (!strcmp(this->sourcetable_fetchers[j]->task->host, config->proxy[i].host)
-			&& this->sourcetable_fetchers[j]->task->port == config->proxy[i].port) {
-				p = this->sourcetable_fetchers[j];
-				/* Found, clear in the old table */
-				this->sourcetable_fetchers[j] = NULL;
-				break;
+		if (olddyn)
+			for (int j = 0; j < olddyn->sourcetable_fetchers_count; j++) {
+				if (olddyn->sourcetable_fetchers[j] == NULL)
+					/* Already cleared */
+					continue;
+				if (!strcmp(olddyn->sourcetable_fetchers[j]->task->host, config->proxy[i].host)
+				&& olddyn->sourcetable_fetchers[j]->task->port == config->proxy[i].port) {
+					p = olddyn->sourcetable_fetchers[j];
+					/* Found, clear in the old table */
+					olddyn->sourcetable_fetchers[j] = NULL;
+					break;
+				}
 			}
-		}
 		if (!p) {
 			/* Not found, create */
 			p = fetcher_sourcetable_new(this,
@@ -879,46 +1017,37 @@ static int caster_reload_fetchers(struct caster_state *this) {
 				config->proxy[i].tls,
 				config->proxy[i].table_refresh_delay,
 				config->proxy[i].priority);
-			if (p) {
-				logfmt(&this->flog, LOG_INFO, "New fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
-				fetcher_sourcetable_start(p, 0);
-			} else {
-				logfmt(&this->flog, LOG_ERR, "Can't start fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
-				r = -1;
-			}
-		} else {
-			fetcher_sourcetable_reload(p,
-				config->proxy[i].table_refresh_delay,
-				config->proxy[i].priority);
-			logfmt(&this->flog, LOG_INFO, "Reusing fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
 		}
 		new_fetchers[i] = p;
 	}
-	/*
-	 * Stop and free all remaining fetchers in the old configuration.
-	 */
-	for (int j = 0; j < this->sourcetable_fetchers_count; j++)
-		if (this->sourcetable_fetchers[j]) {
-			logfmt(&this->flog, LOG_INFO, "Stopping fetcher %s:%d", this->sourcetable_fetchers[j]->task->host, this->sourcetable_fetchers[j]->task->port);
-			fetcher_sourcetable_free(this->sourcetable_fetchers[j]);
-		}
-	free(this->sourcetable_fetchers);
-	this->sourcetable_fetchers_count = config->proxy_count;
-	this->sourcetable_fetchers = new_fetchers;
+	newdyn->sourcetable_fetchers_count = config->proxy_count;
+	newdyn->sourcetable_fetchers = new_fetchers;
 	return r;
 }
 
-static void caster_free_fetchers(struct caster_state *this) {
-	struct sourcetable_fetch_args **a = this->sourcetable_fetchers;
-	if (!a)
-		return;
-	for (int i = 0; i < this->sourcetable_fetchers_count; i++) {
-		if (a[i])
-			fetcher_sourcetable_free(a[i]);
+/*
+ * Start sourcetable fetchers
+ */
+static int caster_start_fetchers(struct caster_state *this, struct config *config, struct caster_dynconfig *newdyn) {
+	int r = 0;
+	for (int i = 0; i < newdyn->sourcetable_fetchers_count; i++) {
+		struct sourcetable_fetch_args *p = newdyn->sourcetable_fetchers[i];
+		if (p) {
+			if (ntrip_task_get_state(p->task) == TASK_INIT) {
+				logfmt(&this->flog, LOG_INFO, "New fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
+				fetcher_sourcetable_start(p, 0);
+			} else {
+				fetcher_sourcetable_reload(p,
+					config->proxy[i].table_refresh_delay,
+					config->proxy[i].priority);
+				logfmt(&this->flog, LOG_INFO, "Reusing fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
+			}
+		} else {
+			logfmt(&this->flog, LOG_ERR, "Can't start fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
+			r = -1;
+		}
 	}
-	free(a);
-	this->sourcetable_fetchers = NULL;
-	this->sourcetable_fetchers_count = 0;
+	return r;
 }
 
 int caster_main(char *config_file) {
@@ -940,18 +1069,27 @@ int caster_main(char *config_file) {
 		return 1;
 	}
 
-	if (caster_reload(caster) < 0) {
+	if (caster_set_signals(caster) < 0) {
 		caster_free(caster);
 		return 1;
 	}
 
-	if (caster_set_signals(caster) < 0) {
+	if (caster_load(caster, 0) < 0) {
 		caster_free(caster);
 		return 1;
 	}
 
 	if (threads && jobs_start_threads(caster->joblist, nthreads) < 0) {
 		logfmt(&caster->flog, LOG_CRIT, "Could not create threads!");
+		caster_free(caster);
+		return 1;
+	}
+
+	/*
+	 * Needs to be done after starting the threads, else caster_free()/ntrip_drop_by_id()
+	 * may end up in an infinite loop.
+	 */
+	if (caster_start(caster, caster->config ,1)) {
 		caster_free(caster);
 		return 1;
 	}

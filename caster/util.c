@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/cdefs.h>
@@ -13,6 +14,7 @@
 
 #include "conf.h"
 #include "log.h"
+#include "packet.h"
 #include "util.h"
 
 /*
@@ -373,6 +375,23 @@ struct mime_content *mime_new(char *s, long long len, const char *mime_type, int
 	m->len = len >= 0 ? len : strlen(s);
 	m->mime_type = mime_type;
 	m->use_strfree = use_strfree;
+	m->packet = NULL;
+	return m;
+}
+
+/*
+ * Create a mime_content from a reference-counted packet.
+ */
+struct mime_content *mime_new_from_packet(const char *mime_type, struct packet *packet) {
+	struct mime_content *m = (struct mime_content *)malloc(sizeof(struct mime_content));
+	if (m == NULL)
+		return NULL;
+	packet_incref(packet);
+	m->s = (char *)packet->data;
+	m->len = packet->datalen;
+	m->mime_type = mime_type;
+	m->use_strfree = 0;
+	m->packet = packet;
 	return m;
 }
 
@@ -381,15 +400,20 @@ void mime_set_type(struct mime_content *this, const char *mime_type) {
 }
 
 void mime_free(struct mime_content *this) {
-	if (this->use_strfree)
+	if (this->packet)
+		packet_decref(this->packet);
+	else if (this->use_strfree)
 		strfree((char *)this->s);
 	else
 		free((void *)this->s);
 	free(this);
 }
 
-void mime_append(struct mime_content *this, const char *s) {
+static void mime_append(struct mime_content *this, const char *s) {
 	int len = strlen(s);
+	if (this->packet)
+		// Not used in packet mode
+		return;
 	char *new = (char *)strrealloc(this->s, this->len + len + 1);
 	if (new) {
 		this->s = new;
@@ -431,6 +455,15 @@ void timeval_from_iso_date(struct timeval *t, const char *iso_date) {
 	time_t tv_sec = timegm(&date);
 	t->tv_sec = tv_sec;
 	t->tv_usec = tv_usec;
+}
+
+/*
+ * Convert timeval to ISO date and insert in a JSON object.
+ */
+void timeval_to_json(struct timeval *t, json_object *json, const char *json_key) {
+	char iso_date[30];
+	iso_date_from_timeval(iso_date, sizeof iso_date, t);
+	json_object_object_add_ex(json, json_key, json_object_new_string(iso_date), JSON_C_CONSTANT_NEW);
 }
 
 #if DEBUG
@@ -487,6 +520,44 @@ void strfree_callback(const void *data, size_t datalen, void *extra) {
  */
 void mime_free_callback(const void *data, size_t datalen, void *extra) {
 	mime_free((struct mime_content *)extra);
+}
+
+/*
+ * Return a malloc'd absolute file path with dir preprended.
+ * If path is already absolute, return a copy of path.
+ */
+char *joinpath(const char *dir, const char *path) {
+	char *new_path;
+	int len, addslash;
+	if (*path != '/') {
+		int lendir = strlen(dir);
+		addslash = (lendir == 0 || dir[lendir-1] != '/');
+		len = strlen(path) + lendir + addslash + 1;
+	} else {
+		len = strlen(path) + 1;
+	}
+
+	new_path = (char *)strmalloc(len);
+	if (new_path == NULL)
+		return NULL;
+
+	if (*path != '/')
+		snprintf(new_path, len, "%s%s%s", dir, addslash?"/":"", path);
+	else
+		strncpy(new_path, path, len);
+	return new_path;
+}
+
+/*
+ * fopen using dir to make file paths absolute (see joinpath).
+ */
+FILE *fopen_absolute(const char *dir, const char *filename, const char *mode) {
+	char *path = joinpath(dir, filename);
+	if (path == NULL)
+		return NULL;
+	FILE *r = fopen(path, mode);
+	strfree(path);
+	return r;
 }
 
 static void string_array_free(string_array_t *s) {
@@ -549,7 +620,7 @@ static string_array_t *split(const char *s, char sep, int maxsplits) {
  * Read a file with fields separated by characters in seps.
  * Skip empty fields if skipempty is not 0.
  */
-struct parsed_file *file_parse(const char *filename, int nfields, const char *seps, const int skipempty, struct log *log) {
+struct parsed_file *file_parse(const char *dir, const char *filename, int nfields, const char *seps, const int skipempty, struct log *log) {
 	char *line = NULL;
 	size_t linecap = 0;
 	ssize_t linelen;
@@ -557,7 +628,7 @@ struct parsed_file *file_parse(const char *filename, int nfields, const char *se
 	int nlines = 0;
 	int err = 0;
 
-	FILE *fp = fopen(filename, "r");
+	FILE *fp = fopen_absolute(dir, filename, "r");
 
 	if (fp == NULL) {
 		logfmt(log, LOG_ERR, "Can't open %s", filename);

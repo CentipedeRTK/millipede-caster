@@ -116,7 +116,10 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->client = 0;
 	this->rtcm_filter = 0;
 	this->rtcm_client_state = NTRIP_RTCM_POS_WAIT;
+	this->node = NULL;
+	this->syncer_id = NULL;
 
+	this->tmpconfig = NULL;
 	this->config = caster_config_getref(this->caster);
 	this->lookup_dist = this->config->max_nearest_lookup_distance_m;
 	return this;
@@ -128,14 +131,13 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
  * Required locks: ntrip_state
  */
 struct config *ntrip_refresh_config(struct ntrip_state *this) {
-	struct config *new_config = atomic_load(&this->caster->config);
-	struct config *old_config = this->config;
-	if (new_config != old_config) {
-		new_config = caster_config_getref(this->caster);
-		this->config = new_config;
-		config_decref(old_config);
+	struct config *config = this->tmpconfig?this->tmpconfig:this->config;
+	if (this->tmpconfig && this->tmpconfig != this->config) {
+		config_incref(this->tmpconfig);
+		config_decref(this->config);
+		this->config = config;
 	}
-	return new_config;
+	return config;
 }
 
 /*
@@ -388,6 +390,10 @@ static void _ntrip_free(struct ntrip_state *this, char *orig, int unlink) {
 		P_RWLOCK_UNLOCK(&this->caster->quotalock);
 	}
 
+	strfree(this->syncer_id);
+	if (this->node)
+		json_object_put(this->node);
+
 	/*
 	 * This will prevent any further locking on the ntrip_state, so we do
 	 * it only once it is removed from ntrips.queue.
@@ -577,9 +583,11 @@ void ntrip_deferred_run(struct caster_state *this) {
 int ntrip_drop_by_id(struct caster_state *caster, long long id) {
 	int r = 0;
 
-	struct ntrip_state *st, *tmpst;
+	struct ntrip_state *st;
+
+    restart:
 	P_RWLOCK_WRLOCK(&caster->ntrips.lock);
-	TAILQ_FOREACH_SAFE(st, &caster->ntrips.queue, nextg, tmpst) {
+	TAILQ_FOREACH(st, &caster->ntrips.queue, nextg) {
 		struct bufferevent *bev = st->bev;
 		bufferevent_lock(bev);
 		if (id && st->id > id) {
@@ -590,9 +598,16 @@ int ntrip_drop_by_id(struct caster_state *caster, long long id) {
 			ntrip_notify_close(st);
 			ntrip_decref_end(st, "ntrip_drop_by_id");
 			r += 1;
-			if (id) {
-				bufferevent_unlock(bev);
+			bufferevent_unlock(bev);
+			if (id)
 				break;
+			else {
+				// Restart from the head, as
+				// TAILQ_FOREACH_SAFE does not
+				// protect us from all deletion cases
+				// caused by ntrip_notify_close().
+				P_RWLOCK_UNLOCK(&caster->ntrips.lock);
+				goto restart;
 			}
 		}
 		bufferevent_unlock(bev);
@@ -660,7 +675,8 @@ _ntrip_log(struct log *log, struct ntrip_state *this, int level, const char *fmt
 	gelf_init(&g, level, this->caster->hostname, thread_id);
 	g.connection_id = this->id;
 
-	if (this->caster->graylog && this->caster->graylog[0] && this->task && this->task->nograylog)
+	if (this->caster->graylog_log_level == -1
+		|| (this->config->dyn->graylog && this->config->dyn->graylog[0] && this->task && this->task->nograylog))
 		g.nograylog = 1;
 
 	if (this->remote) {
