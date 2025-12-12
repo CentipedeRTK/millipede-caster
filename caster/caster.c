@@ -84,7 +84,7 @@ _caster_log(struct caster_state *caster, struct gelf_entry *g, struct log *log, 
 	char *msg;
 	vasprintf(&msg, fmt, ap);
 
-	if (level <= caster->log_level) {
+	if (level <= atomic_load(&caster->log_level)) {
 		if (threads)
 			logfmt_direct(log, "%s [%lu] %s\n", date, (long)pthread_getspecific(caster->thread_id), msg);
 		else
@@ -96,7 +96,7 @@ _caster_log(struct caster_state *caster, struct gelf_entry *g, struct log *log, 
 	else
 		free(msg);
 
-	if (level != -1 && !g->nograylog && level <= caster->graylog_log_level) {
+	if (level != -1 && !g->nograylog && level <= atomic_load(&caster->graylog_log_level)) {
 		json_object *j = gelf_json(g);
 		char *s = mystrdup(json_object_to_json_string(j));
 		json_object_put(j);
@@ -121,7 +121,7 @@ caster_alog(void *arg, struct gelf_entry *g, int dummy, const char *fmt, va_list
 static void
 caster_log_cb(void *arg, struct gelf_entry *g, int level, const char *fmt, va_list ap) {
 	struct caster_state *this = (struct caster_state *)arg;
-	if (level <= this->log_level || level <= this->graylog_log_level)
+	if (level <= atomic_load(&this->log_level) || level <= atomic_load(&this->graylog_log_level))
 		_caster_log(this, g, &this->flog, level, fmt, ap);
 }
 
@@ -238,7 +238,7 @@ dynconfig_free_callback(struct config *config) {
 }
 
 static struct caster_state *
-caster_new(const char *config_file) {
+caster_new(const char *config_file, int nbase) {
 	int err = 0;
 	struct caster_state *this = (struct caster_state *)calloc(1, sizeof(struct caster_state));
 	if (this == NULL)
@@ -249,12 +249,32 @@ caster_new(const char *config_file) {
 	struct event_base *base;
 	struct evdns_base *dns_base;
 
-	base = event_base_new();
-	if (!base) {
-		fprintf(stderr, "Could not initialize libevent!\n");
+	this->base = (struct event_base **)calloc(nbase, sizeof(struct event_base *));
+	if (this->base == NULL) {
+		free(this);
 		return NULL;
 	}
-	dns_base = evdns_base_new(base, 1);
+	this->nbase = nbase;
+	atomic_store(&this->basecounter, 0);
+	for (int i = 0; i < this->nbase; i++) {
+		base = event_base_new();
+		if (!base) {
+			err = 1;
+			fprintf(stderr, "Could not initialize libevent!\n");
+			break;
+		}
+		this->base[i] = base;
+	}
+	if (err) {
+		for (int i = 0; i < this->nbase; i++)
+			if (this->base[i] != NULL)
+				event_base_free(this->base[i]);
+		free(this->base);
+		free(this);
+		return NULL;
+	}
+
+	dns_base = evdns_base_new(this->base[0], 1);
 	if (!dns_base) {
 		fprintf(stderr, "Could not initialize dns_base!\n");
 		return NULL;
@@ -284,6 +304,7 @@ caster_new(const char *config_file) {
 	this->ntrips.ipcount = hash_table_new(509, NULL);
 
 	// Used for access to config and reload serializing
+	atomic_store(&this->config_gen, 1);
 	P_RWLOCK_INIT(&this->configlock, NULL);
 	P_MUTEX_INIT(&this->configreload, NULL);
 
@@ -335,7 +356,6 @@ caster_new(const char *config_file) {
 		return NULL;
 	}
 
-	this->base = base;
 	this->dns_base = dns_base;
 	TAILQ_INIT(&this->ntrips.queue);
 	TAILQ_INIT(&this->ntrips.free_queue);
@@ -381,13 +401,13 @@ static int caster_reload_syncers(struct caster_state *this, struct config *confi
 	return 0;
 }
 
-static int caster_start_syncers(struct caster_state *this, struct config *config, struct caster_dynconfig *dyn) {
+static int caster_start_syncers(struct caster_state *this, struct config *new_config, struct caster_dynconfig *dyn) {
 	for (int i = 0; i < dyn->syncers_count; i++)
 		syncer_start_all(dyn->syncers[i]);
 	return 0;
 }
 
-static int caster_reload_graylog(struct caster_state *this, struct config *config, struct caster_dynconfig *dyn) {
+static int caster_reload_graylog(struct caster_state *this, struct config *new_config, struct caster_dynconfig *dyn) {
 	int r = 0;
 	int i;
 
@@ -395,46 +415,46 @@ static int caster_reload_graylog(struct caster_state *this, struct config *confi
 
 	struct graylog_sender **new_graylog = NULL;
 
-	if (config->graylog_count) {
-		new_graylog = (struct graylog_sender **)malloc(sizeof(struct graylog_sender *)*config->graylog_count);
+	if (new_config->graylog_count) {
+		new_graylog = (struct graylog_sender **)malloc(sizeof(struct graylog_sender *)*new_config->graylog_count);
 		if (new_graylog == NULL)
 			return -1;
 	}
 
-	for (i = 0; i < config->graylog_count; i++)
+	for (i = 0; i < new_config->graylog_count; i++)
 		new_graylog[i] = NULL;
 
-	for (i = 0; i < config->graylog_count; i++) {
+	for (i = 0; i < new_config->graylog_count; i++) {
 		new_graylog[i] = graylog_sender_new(this,
-			config->graylog[i].host,
-			config->graylog[i].port,
-			config->graylog[i].uri,
-			config->graylog[i].tls,
-			config->graylog[i].status_timeout,
-			config->graylog[i].retry_delay,
-			config->graylog[i].max_retry_delay,
-			config->graylog[i].bulk_max_size,
-			config->graylog[i].queue_max_size,
-			config->graylog[i].authorization,
-			config->graylog[i].drainfilename);
+			new_config->graylog[i].host,
+			new_config->graylog[i].port,
+			new_config->graylog[i].uri,
+			new_config->graylog[i].tls,
+			new_config->graylog[i].status_timeout,
+			new_config->graylog[i].retry_delay,
+			new_config->graylog[i].max_retry_delay,
+			new_config->graylog[i].bulk_max_size,
+			new_config->graylog[i].queue_max_size,
+			new_config->graylog[i].authorization,
+			new_config->graylog[i].drainfilename);
 		if (!new_graylog[i]) {
 			r = -1;
 			break;
 		}
 	}
 	if (r == -1) {
-		for (i = 0; i < config->graylog_count; i++)
+		for (i = 0; i < new_config->graylog_count; i++)
 			if (new_graylog[i] != NULL)
 				graylog_sender_free(new_graylog[i]);
 		free(new_graylog);
 	} else {
 		dyn->graylog = new_graylog;
-		dyn->graylog_count = config->graylog_count;
+		dyn->graylog_count = new_config->graylog_count;
 	}
 	return r;
 }
 
-static int caster_start_graylog(struct caster_state *this, struct config *config, struct caster_dynconfig *dyn) {
+static int caster_start_graylog(struct caster_state *this, struct config *new_config, struct caster_dynconfig *dyn) {
 	for (int i = 0; i < dyn->graylog_count; i++)
 		graylog_sender_start(dyn->graylog[i], 0);
 	return 0;
@@ -449,7 +469,7 @@ void caster_free(struct caster_state *this) {
 		dynconfig_free_fetchers(this->config->dyn);
 		dynconfig_free_syncers(this->config->dyn);
 
-		this->graylog_log_level = -1;
+		atomic_store(&this->graylog_log_level, -1);
 		dynconfig_free_graylog(this->config->dyn);
 	}
 
@@ -475,14 +495,18 @@ void caster_free(struct caster_state *this) {
 	hash_table_free(this->rtcm_cache);
 
 	evdns_base_free(this->dns_base, 1);
-	event_base_free(this->base);
+
+	for (int i = 0; i < this->nbase; i++)
+		event_base_free(this->base[i]);
+	free(this->base);
+
 	SSL_CTX_free(this->ssl_client_ctx);
 
 	P_RWLOCK_WRLOCK(&this->sourcetablestack.lock);
 	struct sourcetable *s;
 	while ((s = TAILQ_FIRST(&this->sourcetablestack.list))) {
 		TAILQ_REMOVE_HEAD(&this->sourcetablestack.list, next);
-		sourcetable_free(s);
+		sourcetable_decref(s);
 	}
 	P_RWLOCK_UNLOCK(&this->sourcetablestack.lock);
 
@@ -588,7 +612,7 @@ static struct listener *listener_new(struct caster_state *this, struct config_bi
 		}
 	}
 
-	listener->listener = evconnlistener_new_bind(this->base, ntripsrv_listener_cb, listener,
+	listener->listener = evconnlistener_new_bind(caster_get_eventbase(this), ntripsrv_listener_cb, listener,
 		LEV_OPT_REUSEABLE|LEV_OPT_CLOSE_ON_FREE, config->queue_size,
 		(struct sockaddr *)sin, sin->generic.sa_family == AF_INET ? sizeof(sin->v4) : sizeof(sin->v6));
 	if (!listener->listener) {
@@ -721,6 +745,7 @@ caster_reload_sourcetables(struct caster_state *caster, struct config *config) {
 		return -1;
 
 	stack_replace_local(caster, &caster->sourcetablestack, local_table);
+	sourcetable_decref(local_table);
 	return 0;
 }
 
@@ -739,21 +764,21 @@ caster_reopen_logs(struct caster_state *this, struct config *config) {
 }
 
 static int
-caster_reload_auth(struct caster_state *caster, struct config *config) {
+caster_reload_auth(struct caster_state *caster, struct config *new_config) {
 	int r = 0;
-	logfmt(&caster->flog, LOG_INFO, "Reloading %s and %s", config->host_auth_filename, config->source_auth_filename);
+	logfmt(&caster->flog, LOG_INFO, "Reloading %s and %s", new_config->host_auth_filename, new_config->source_auth_filename);
 
-	if (config->host_auth_filename) {
-		struct auth_entry *tmp = auth_parse(caster, config->host_auth_filename);
+	if (new_config->host_auth_filename) {
+		struct auth_entry *tmp = auth_parse(caster, new_config->host_auth_filename);
 		if (tmp != NULL) {
-			config->host_auth = tmp;
+			new_config->host_auth = tmp;
 		} else
 			r = -1;
 	}
-	if (config->source_auth_filename) {
-		struct auth_entry *tmp = auth_parse(caster, config->source_auth_filename);
+	if (new_config->source_auth_filename) {
+		struct auth_entry *tmp = auth_parse(caster, new_config->source_auth_filename);
 		if (tmp != NULL) {
-			config->source_auth = tmp;
+			new_config->source_auth = tmp;
 		} else
 			r = -1;
 	}
@@ -761,30 +786,30 @@ caster_reload_auth(struct caster_state *caster, struct config *config) {
 }
 
 static int
-caster_reload_blocklist(struct caster_state *caster, struct config *config) {
+caster_reload_blocklist(struct caster_state *caster, struct config *new_config) {
 	int r = 0;
 	struct prefix_table *p;
 
-	if (config->blocklist_filename) {
-		logfmt(&caster->flog, LOG_INFO, "Reloading %s", config->blocklist_filename);
+	if (new_config->blocklist_filename) {
+		logfmt(&caster->flog, LOG_INFO, "Reloading %s", new_config->blocklist_filename);
 		p = prefix_table_new();
 		if (p == NULL)
 			r = -1;
-		else if (prefix_table_read(p, caster->config_dir, config->blocklist_filename, &caster->flog) < 0) {
+		else if (prefix_table_read(p, caster->config_dir, new_config->blocklist_filename, &caster->flog) < 0) {
 			prefix_table_free(p);
 			p = NULL;
 			r = -1;
 		}
-		config->blocklist = p;
+		new_config->blocklist = p;
 	}
 	return r;
 }
 
 static int
-caster_reload_rtcm_filters(struct caster_state *caster, struct config *config, struct caster_dynconfig *newdyn) {
-	if (config->rtcm_filter_count == 0)
+caster_reload_rtcm_filters(struct caster_state *caster, struct config *new_config, struct caster_dynconfig *newdyn) {
+	if (new_config->rtcm_filter_count == 0)
 		return 0;
-	if (config->rtcm_filter_count != 1)
+	if (new_config->rtcm_filter_count != 1)
 		return -1;
 
 	if (newdyn->rtcm_filter_dict)
@@ -793,18 +818,18 @@ caster_reload_rtcm_filters(struct caster_state *caster, struct config *config, s
 	if (newdyn->rtcm_filter_dict == NULL)
 		return -1;
 
-	for (int i = 0; i < config->rtcm_filter_count; i++) {
+	for (int i = 0; i < new_config->rtcm_filter_count; i++) {
 		struct rtcm_filter *rtcm_filter;
 		rtcm_filter = rtcm_filter_new(
-			config->rtcm_filter[i].pass,
-			config->rtcm_filter[i].convert_count ? config->rtcm_filter[i].convert[0].types : NULL,
-			config->rtcm_filter[i].convert_count ? config->rtcm_filter[i].convert[0].conversion : 0
+			new_config->rtcm_filter[i].pass,
+			new_config->rtcm_filter[i].convert_count ? new_config->rtcm_filter[i].convert[0].types : NULL,
+			new_config->rtcm_filter[i].convert_count ? new_config->rtcm_filter[i].convert[0].conversion : 0
 		);
 		if (rtcm_filter == NULL) {
 			logfmt(&caster->flog, LOG_ERR, "Can't parse rtcm_filter configuration from %s", caster->config_file);
 			return -1;
 		}
-		struct hash_table *h = rtcm_filter_dict_parse(rtcm_filter, config->rtcm_filter[i].apply);
+		struct hash_table *h = rtcm_filter_dict_parse(rtcm_filter, new_config->rtcm_filter[i].apply);
 		if (h == NULL) {
 			logfmt(&caster->flog, LOG_ERR, "Can't parse rtcm_filter configuration from %s", caster->config_file);
 			rtcm_filter_free(rtcm_filter);
@@ -820,15 +845,15 @@ caster_reload_rtcm_filters(struct caster_state *caster, struct config *config, s
 }
 
 static struct config *caster_load_config(struct caster_state *this) {
-	struct config *config;
-	if (!(config = config_parse(this->config_file))) {
+	struct config *new_config;
+	if (!(new_config = config_parse(this->config_file, atomic_fetch_add(&this->config_gen, 1)))) {
 		if (this->config)
 			logfmt(&this->flog, LOG_ERR, "Can't parse configuration from %s", this->config_file);
 		else
 			fprintf(stderr, "Can't parse configuration from %s\n", this->config_file);
 		return NULL;
 	}
-	return config;
+	return new_config;
 }
 
 static void
@@ -838,22 +863,24 @@ signal_cb(evutil_socket_t sig, short events, void *user_data) {
 
 	printf("Caught %s signal; exiting.\n", info->signame);
 	logfmt(&info->caster->flog, LOG_INFO, "Caught %s signal; exiting.", info->signame);
-	event_base_loopexit(info->caster->base, &delay);
+
+	for (int i = 0; i < info->caster->nbase; i++)
+		event_base_loopexit(info->caster->base[i], &delay);
 }
 
-static int caster_start(struct caster_state *this, struct config *config, int lock) {
+static int caster_start(struct caster_state *this, struct config *new_config, int lock) {
 	int r = 0;
 	if (lock)
 		P_MUTEX_LOCK(&this->configreload);
 
-	if (caster_start_fetchers(this, config, config->dyn) < 0)
+	if (caster_start_fetchers(this, new_config, new_config->dyn) < 0)
 		r = -1;
-	if (caster_start_syncers(this, config, config->dyn) < 0)
+	if (caster_start_syncers(this, new_config, new_config->dyn) < 0)
 		r = -1;
-	if (caster_start_graylog(this, config, config->dyn) < 0)
+	if (caster_start_graylog(this, new_config, new_config->dyn) < 0)
 		r = -1;
 	else
-		this->graylog_log_level = config->graylog_count > 0 ? config->graylog[0].log_level : -1;
+		atomic_store(&this->graylog_log_level, new_config->graylog_count > 0 ? new_config->graylog[0].log_level : -1);
 
 	if (lock)
 		P_MUTEX_UNLOCK(&this->configreload);
@@ -861,7 +888,7 @@ static int caster_start(struct caster_state *this, struct config *config, int lo
 }
 
 static int caster_load(struct caster_state *this, int restart) {
-	struct config *config, *old_config;
+	struct config *new_config, *old_config;
 	struct caster_dynconfig *olddyn;
 
 	int r = 0;
@@ -870,13 +897,13 @@ static int caster_load(struct caster_state *this, int restart) {
 	if (newdyn == NULL)
 		return -1;
 
-	config = caster_load_config(this);
+	new_config = caster_load_config(this);
 
 	P_MUTEX_LOCK(&this->configreload);
 
-	this->graylog_log_level = -1;
+	atomic_store(&this->graylog_log_level, -1);
 	old_config = atomic_load(&this->config);
-	if (config == NULL) {
+	if (new_config == NULL) {
 		r = -1;
 		if (old_config == NULL) {
 			// Incorrect new config and no former config:
@@ -886,35 +913,36 @@ static int caster_load(struct caster_state *this, int restart) {
 			return -1;
 		}
 		/* Keep the former config */
-		config = old_config;
+		new_config = old_config;
 		old_config = NULL;
 	}
-	config->dyn = newdyn;
-	config->free_callback = dynconfig_free_callback;
+	new_config->dyn = newdyn;
+	new_config->free_callback = dynconfig_free_callback;
 	olddyn = old_config?old_config->dyn:NULL;
 
 	P_RWLOCK_WRLOCK(&this->configlock);
-	atomic_store(&this->config, config);
+	atomic_store(&this->config, new_config);
 	P_RWLOCK_UNLOCK(&this->configlock);
 
-	this->log_level = config->log_level;
-	if (caster_reopen_logs(this, config) < 0)
+	this->log_level = new_config->log_level;
+	atomic_store(&this->backlog_evbuffer, new_config->backlog_evbuffer);
+	if (caster_reopen_logs(this, new_config) < 0)
 		r = -1;
-	if (caster_reload_sourcetables(this, config) < 0)
+	if (caster_reload_sourcetables(this, new_config) < 0)
 		r = -1;
-	if (caster_reload_auth(this, config) < 0)
+	if (caster_reload_auth(this, new_config) < 0)
 		r = -1;
-	if (caster_reload_blocklist(this, config) < 0)
+	if (caster_reload_blocklist(this, new_config) < 0)
 		r = -1;
-	if (caster_reload_rtcm_filters(this, config, newdyn) < 0)
+	if (caster_reload_rtcm_filters(this, new_config, newdyn) < 0)
 		r = -1;
-	if (caster_reload_graylog(this, config, newdyn) < 0)
+	if (caster_reload_graylog(this, new_config, newdyn) < 0)
 		r = -1;
-	if (caster_reload_listeners(this, config, olddyn, newdyn) < 0)
+	if (caster_reload_listeners(this, new_config, olddyn, newdyn) < 0)
 		r = -1;
-	if (caster_reload_fetchers(this, config, olddyn, newdyn) < 0)
+	if (caster_reload_fetchers(this, new_config, olddyn, newdyn) < 0)
 		r = -1;
-	if (caster_reload_syncers(this, config, olddyn, newdyn) < 0)
+	if (caster_reload_syncers(this, new_config, olddyn, newdyn) < 0)
 		r = -1;
 	if (olddyn != NULL) {
 		dynconfig_free_fetchers(olddyn);
@@ -924,7 +952,7 @@ static int caster_load(struct caster_state *this, int restart) {
 	if (old_config)
 		config_decref(old_config);
 
-	if (restart && caster_start(this, config, 0) < 0)
+	if (restart && caster_start(this, new_config, 0) < 0)
 		r = -1;
 
 	P_MUTEX_UNLOCK(&this->configreload);
@@ -957,13 +985,13 @@ static int caster_set_signals(struct caster_state *this) {
 	this->sigint_info.signame = "SIGINT";
 	this->sigterm_info.signame = "SIGTERM";
 	this->sigterm_info.caster = this;
-	this->signalint_event = evsignal_new(this->base, SIGINT, signal_cb, (void *)&this->sigint_info);
+	this->signalint_event = evsignal_new(caster_get_eventbase(this), SIGINT, signal_cb, (void *)&this->sigint_info);
 	if (!this->signalint_event || event_add(this->signalint_event, NULL) < 0) {
 		fprintf(stderr, "Could not create/add SIGINT signal event!\n");
 		return -1;
 	}
 
-	this->signalterm_event = evsignal_new(this->base, SIGTERM, signal_cb, (void *)&this->sigterm_info);
+	this->signalterm_event = evsignal_new(caster_get_eventbase(this), SIGTERM, signal_cb, (void *)&this->sigterm_info);
 	if (!this->signalterm_event || event_add(this->signalterm_event, NULL) < 0) {
 		fprintf(stderr, "Could not create/add SIGTERM signal event!\n");
 		return -1;
@@ -971,7 +999,7 @@ static int caster_set_signals(struct caster_state *this) {
 
 	signal(SIGPIPE, SIG_IGN);
 
-	this->signalhup_event = evsignal_new(this->base, SIGHUP, signalhup_cb, (void *)this);
+	this->signalhup_event = evsignal_new(caster_get_eventbase(this), SIGHUP, signalhup_cb, (void *)this);
 	if (!this->signalhup_event || event_add(this->signalhup_event, 0) < 0) {
 		fprintf(stderr, "Could not create/add SIGHUP signal event!\n");
 		return -1;
@@ -982,28 +1010,28 @@ static int caster_set_signals(struct caster_state *this) {
 /*
  * Reload sourcetable fetchers
  */
-static int caster_reload_fetchers(struct caster_state *this, struct config *config,
+static int caster_reload_fetchers(struct caster_state *this, struct config *new_config,
 	struct caster_dynconfig *olddyn,
 	struct caster_dynconfig *newdyn) {
 	int r = 0;
 	struct sourcetable_fetch_args **new_fetchers;
-	if (config->proxy_count)
-		new_fetchers = (struct sourcetable_fetch_args **)malloc(sizeof(struct sourcetable_fetch_args *)*config->proxy_count);
+	if (new_config->proxy_count)
+		new_fetchers = (struct sourcetable_fetch_args **)malloc(sizeof(struct sourcetable_fetch_args *)*new_config->proxy_count);
 	else
 		new_fetchers = NULL;
 
 	/*
 	 * For each entry in the new config, recycle a similar entry in the old configuration.
 	 */
-	for (int i = 0; i < config->proxy_count; i++) {
+	for (int i = 0; i < new_config->proxy_count; i++) {
 		struct sourcetable_fetch_args *p = NULL;
 		if (olddyn)
 			for (int j = 0; j < olddyn->sourcetable_fetchers_count; j++) {
 				if (olddyn->sourcetable_fetchers[j] == NULL)
 					/* Already cleared */
 					continue;
-				if (!strcmp(olddyn->sourcetable_fetchers[j]->task->host, config->proxy[i].host)
-				&& olddyn->sourcetable_fetchers[j]->task->port == config->proxy[i].port) {
+				if (!strcmp(olddyn->sourcetable_fetchers[j]->task->host, new_config->proxy[i].host)
+				&& olddyn->sourcetable_fetchers[j]->task->port == new_config->proxy[i].port) {
 					p = olddyn->sourcetable_fetchers[j];
 					/* Found, clear in the old table */
 					olddyn->sourcetable_fetchers[j] = NULL;
@@ -1013,14 +1041,14 @@ static int caster_reload_fetchers(struct caster_state *this, struct config *conf
 		if (!p) {
 			/* Not found, create */
 			p = fetcher_sourcetable_new(this,
-				config->proxy[i].host, config->proxy[i].port,
-				config->proxy[i].tls,
-				config->proxy[i].table_refresh_delay,
-				config->proxy[i].priority);
+				new_config->proxy[i].host, new_config->proxy[i].port,
+				new_config->proxy[i].tls,
+				new_config->proxy[i].table_refresh_delay,
+				new_config->proxy[i].priority);
 		}
 		new_fetchers[i] = p;
 	}
-	newdyn->sourcetable_fetchers_count = config->proxy_count;
+	newdyn->sourcetable_fetchers_count = new_config->proxy_count;
 	newdyn->sourcetable_fetchers = new_fetchers;
 	return r;
 }
@@ -1028,22 +1056,22 @@ static int caster_reload_fetchers(struct caster_state *this, struct config *conf
 /*
  * Start sourcetable fetchers
  */
-static int caster_start_fetchers(struct caster_state *this, struct config *config, struct caster_dynconfig *newdyn) {
+static int caster_start_fetchers(struct caster_state *this, struct config *new_config, struct caster_dynconfig *newdyn) {
 	int r = 0;
 	for (int i = 0; i < newdyn->sourcetable_fetchers_count; i++) {
 		struct sourcetable_fetch_args *p = newdyn->sourcetable_fetchers[i];
 		if (p) {
 			if (ntrip_task_get_state(p->task) == TASK_INIT) {
-				logfmt(&this->flog, LOG_INFO, "New fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
+				logfmt(&this->flog, LOG_INFO, "New fetcher %s:%d", new_config->proxy[i].host, new_config->proxy[i].port);
 				fetcher_sourcetable_start(p, 0);
 			} else {
 				fetcher_sourcetable_reload(p,
-					config->proxy[i].table_refresh_delay,
-					config->proxy[i].priority);
-				logfmt(&this->flog, LOG_INFO, "Reusing fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
+					new_config->proxy[i].table_refresh_delay,
+					new_config->proxy[i].priority);
+				logfmt(&this->flog, LOG_INFO, "Reusing fetcher %s:%d", new_config->proxy[i].host, new_config->proxy[i].port);
 			}
 		} else {
-			logfmt(&this->flog, LOG_ERR, "Can't start fetcher %s:%d", config->proxy[i].host, config->proxy[i].port);
+			logfmt(&this->flog, LOG_ERR, "Can't start fetcher %s:%d", new_config->proxy[i].host, new_config->proxy[i].port);
 			r = -1;
 		}
 	}
@@ -1063,7 +1091,12 @@ int caster_main(char *config_file) {
 		return 1;
 	}
 
-	caster = caster_new(config_file);
+	int nbase, neventloops;
+
+	nbase = (nthreads+3)/4;
+	neventloops = nbase-1;
+
+	caster = caster_new(config_file, nbase);
 	if (!caster) {
 		fprintf(stderr, "Can't allocate caster\n");
 		return 1;
@@ -1079,7 +1112,7 @@ int caster_main(char *config_file) {
 		return 1;
 	}
 
-	if (threads && jobs_start_threads(caster->joblist, nthreads) < 0) {
+	if (threads && jobs_start_threads(caster->joblist, nthreads, neventloops) < 0) {
 		logfmt(&caster->flog, LOG_CRIT, "Could not create threads!");
 		caster_free(caster);
 		return 1;
@@ -1094,7 +1127,7 @@ int caster_main(char *config_file) {
 		return 1;
 	}
 
-	event_base_dispatch(caster->base);
+	event_base_dispatch(caster->base[0]);
 
 	logfmt(&caster->flog, LOG_NOTICE, "Stopping caster");
 	caster_free(caster);

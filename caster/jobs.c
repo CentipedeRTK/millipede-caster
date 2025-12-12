@@ -253,7 +253,7 @@ void joblist_run(struct joblist *this) {
 			st->njobs--;
 			if (st->newjobs > 0)
 				st->newjobs--;
-			if (st->state != NTRIP_END) {
+			if (ntrip_get_state(st) != NTRIP_END) {
 				switch (j->type) {
 				case JOB_LIBEVENT_RW:
 					j->rw.cb(bev, (void *)st);
@@ -336,7 +336,7 @@ static void _joblist_append_generic(struct joblist *this, struct ntrip_state *st
 	P_MUTEX_LOCK(&this->append_mutex);
 
 	/* Drop callback if ntrip_state is waiting for deletion */
-	if (st->state == NTRIP_END) {
+	if (ntrip_get_state(st) == NTRIP_END) {
 		P_MUTEX_UNLOCK(&this->append_mutex);
 		return;
 	}
@@ -575,19 +575,26 @@ void joblist_drain(struct ntrip_state *st) {
 struct thread_start_args {
 	long thread_id;
 	struct caster_state *caster;
+	char do_eventloop;
+	struct event_base *event_base;
 };
 
 void *jobs_start_routine(void *arg) {
 	struct thread_start_args *start_args = (struct thread_start_args *)arg;
+	int do_eventloop = start_args->do_eventloop;
 	struct caster_state *caster = start_args->caster;
+	struct event_base *event_base = start_args->event_base;
 	pthread_setspecific(caster->thread_id, (void *)(start_args->thread_id));
-	printf("started thread %lu\n", start_args->thread_id);
+	printf("started thread %lu as %s worker\n", start_args->thread_id, do_eventloop?"event":"generic");
 	free(start_args);
-	joblist_run(caster->joblist);
+	if (do_eventloop)
+		event_base_loop(event_base, EVLOOP_NO_EXIT_ON_EMPTY);
+	else
+		joblist_run(caster->joblist);
 	return NULL;
 }
 
-int jobs_start_threads(struct joblist *this, int nthreads) {
+int jobs_start_threads(struct joblist *this, int nthreads, int neventloops) {
 	int err = 0;
 	pthread_t *p = (pthread_t *)malloc(sizeof(pthread_t)*nthreads);
 	if (p == NULL) {
@@ -607,6 +614,11 @@ int jobs_start_threads(struct joblist *this, int nthreads) {
 	int i;
 	for (i = 0; i < nthreads; i++) {
 		struct thread_start_args *args = (struct thread_start_args *)malloc(sizeof(struct thread_start_args));
+		args->do_eventloop = (i < neventloops);
+		if (args->do_eventloop)
+			args->event_base = this->caster->base[i+1];
+		else
+			args->event_base = NULL;
 		args->thread_id = i+1;
 		args->caster = this->caster;
 		int r = pthread_create(&p[i], &attr, jobs_start_routine, args);

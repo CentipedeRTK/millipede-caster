@@ -107,7 +107,7 @@ static int ntripsrv_send_sourcetable(struct ntrip_state *this, struct evbuffer *
 		return 503;
 
 	struct mime_content *m = sourcetable_get(sourcetable);
-	sourcetable_free(sourcetable);
+	sourcetable_decref(sourcetable);
 	if (m == NULL)
 		return 503;
 
@@ -163,14 +163,14 @@ void ntripsrv_deferred_output(
 	bufferevent_lock(st->bev);
 
 	/* Check for NTRIP_END, as we should never get back from this state */
-	if (st->state != NTRIP_END) {
+	if (ntrip_get_state(st) != NTRIP_END) {
 		struct evbuffer *output = bufferevent_get_output(st->bev);
 		send_server_reply(st, output, req->status, NULL, NULL, m);
 
 		if (st->connection_keepalive && st->received_keepalive)
-			st->state = NTRIP_WAIT_HTTP_METHOD;
+			ntrip_set_state(st, NTRIP_WAIT_HTTP_METHOD);
 		else
-			st->state = NTRIP_WAIT_CLOSE;
+			ntrip_set_state(st, NTRIP_WAIT_CLOSE);
 	} else
 		mime_free(m);
 	bufferevent_unlock(st->bev);
@@ -277,7 +277,7 @@ void ntripsrv_redo_virtual_pos(struct ntrip_state *st) {
 
 	struct dist_table *s = sourcetable_find_pos(pos_sourcetable, &st->last_pos);
 	if (s == NULL) {
-		sourcetable_free(pos_sourcetable);
+		sourcetable_decref(pos_sourcetable);
 		return;
 	}
 
@@ -294,7 +294,7 @@ void ntripsrv_redo_virtual_pos(struct ntrip_state *st) {
 
 	if (s->size_dist_array == 0) {
 		dist_table_free(s);
-		sourcetable_free(pos_sourcetable);
+		sourcetable_decref(pos_sourcetable);
 		return;
 	}
 
@@ -340,11 +340,11 @@ void ntripsrv_redo_virtual_pos(struct ntrip_state *st) {
 				if (source_state == LIVESOURCE_RUNNING || (s->dist_array[0].on_demand && source_state == LIVESOURCE_FETCH_PENDING)) {
 					struct packet *packet_pos = ntrip_get_rtcm_pos(st, m);
 					if (packet_pos) {
-						st->rtcm_client_state = NTRIP_RTCM_POS_OK;
+						atomic_store(&st->rtcm_client_state, NTRIP_RTCM_POS_OK);
 						packet_send(packet_pos, st, time(NULL));
 						packet_decref(packet_pos);
 					} else
-						st->rtcm_client_state = NTRIP_RTCM_POS_WAIT;
+						atomic_store(&st->rtcm_client_state, NTRIP_RTCM_POS_WAIT);
 					st->tmp_pos = s->dist_array[0].pos;
 					joblist_append_ntrip_livesource(st->caster->joblist, redistribute_switch_source, st, l, NULL);
 				}
@@ -353,7 +353,7 @@ void ntripsrv_redo_virtual_pos(struct ntrip_state *st) {
 		}
 	}
 
-	sourcetable_free(pos_sourcetable);
+	sourcetable_decref(pos_sourcetable);
 	dist_table_free(s);
 }
 
@@ -411,18 +411,18 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 
 	struct config *config = ntrip_refresh_config(st);
 
-	ntrip_log(st, LOG_EDEBUG, "ntripsrv_readcb state %d len %d", st->state, evbuffer_get_length(st->filter.raw_input));
+	ntrip_log(st, LOG_EDEBUG, "ntripsrv_readcb state %d len %d", ntrip_get_state(st), evbuffer_get_length(st->filter.raw_input));
 
 	if (ntrip_filter_run_input(st) < 0)
 		return;
 
 	if (st->chunk_state == CHUNK_END && evbuffer_get_length(st->input) == 0) {
-		st->state = NTRIP_FORCE_CLOSE;
+		ntrip_set_state(st, NTRIP_FORCE_CLOSE);
 		err = 1;
 	}
 
-	while (!err && st->state != NTRIP_WAIT_CLOSE && (waiting_len = evbuffer_get_length(st->input)) > 0) {
-		if (st->state == NTRIP_WAIT_HTTP_METHOD) {
+	while (!err && ntrip_get_state(st) != NTRIP_WAIT_CLOSE && (waiting_len = evbuffer_get_length(st->input)) > 0) {
+		if (ntrip_get_state(st) == NTRIP_WAIT_HTTP_METHOD) {
 			char *token;
 
 			ntrip_clear_request(st);
@@ -465,9 +465,9 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					break;
 				}
 			}
-			st->state = NTRIP_WAIT_HTTP_HEADER;
+			ntrip_set_state(st, NTRIP_WAIT_HTTP_HEADER);
 			st->received_keepalive = 0;
-		} else if (st->state == NTRIP_WAIT_HTTP_HEADER) {
+		} else if (ntrip_get_state(st) == NTRIP_WAIT_HTTP_HEADER) {
 			line = evbuffer_readln(st->input, &len, EVBUFFER_EOL_CRLF);
 			if ((line?len:waiting_len) > config->http_header_max_size) {
 				err = 431;
@@ -593,7 +593,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 
 					if (*mountpoint) {
 						if (config->dyn->rtcm_filter && rtcm_filter_check_mountpoint(config->dyn, mountpoint))
-							st->rtcm_filter = 1;
+							atomic_store(&st->use_rtcm_filter, 1);
 						/*
 						 * Find both a relevant source line and a live source (actually live or on-demand).
 						 */
@@ -612,12 +612,12 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						err = ntripsrv_send_sourcetable(st, output);
 						if (st->connection_keepalive && st->received_keepalive) {
 							if (st->content_length)
-								st->state = NTRIP_WAIT_CLIENT_CONTENT;
+								ntrip_set_state(st, NTRIP_WAIT_CLIENT_CONTENT);
 							else
-								st->state = NTRIP_WAIT_HTTP_METHOD;
+								ntrip_set_state(st, NTRIP_WAIT_HTTP_METHOD);
 							continue;
 						} else {
-							st->state = NTRIP_WAIT_CLOSE;
+							ntrip_set_state(st, NTRIP_WAIT_CLOSE);
 							break;
 						}
 					}
@@ -630,11 +630,11 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					if (sourceline) {
 						st->source_virtual = sourceline->virtual;
 						st->source_on_demand = sourceline->on_demand;
+						sourceline_decref(sourceline);
 					} else {
 						st->source_virtual = 0;
 						st->source_on_demand = 1;
 					}
-
 					st->type = "client";
 
 					/* Regular NTRIP stream client: set a read timeout to check for data sent */
@@ -645,7 +645,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						if (!l) {
 							if (st->client_version == 1) {
 								err = ntripsrv_send_sourcetable(st, output);
-								st->state = NTRIP_WAIT_CLOSE;
+								ntrip_set_state(st, NTRIP_WAIT_CLOSE);
 							} else
 								err = 404;
 							break;
@@ -659,8 +659,8 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						break;
 					}
 					ntripsrv_send_stream_result_ok(st, output, "gnss/data", NULL);
-					st->state = NTRIP_WAIT_CLIENT_INPUT;
-					st->rtcm_client_state = st->source_virtual ? NTRIP_RTCM_POS_WAIT : NTRIP_RTCM_POS_OK;
+					ntrip_set_state(st, NTRIP_WAIT_CLIENT_INPUT);
+					atomic_store(&st->rtcm_client_state, st->source_virtual ? NTRIP_RTCM_POS_WAIT : NTRIP_RTCM_POS_OK);
 
 					/* If we have a position (Ntrip-gga header), use it */
 
@@ -685,7 +685,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 								err = 400;
 								break;
 							}
-							st->state = NTRIP_WAIT_CLIENT_CONTENT;
+							ntrip_set_state(st, NTRIP_WAIT_CLIENT_CONTENT);
 							struct timeval adm_read_timeout = { 0, 0 };
 							bufferevent_set_timeouts(bev, &adm_read_timeout, NULL);
 							continue;
@@ -724,7 +724,6 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 							mountpoint++;
 						st->client_version = 1;
 					}
-					struct sourceline *sourceline = stack_find_local_mountpoint(st->caster, &st->caster->sourcetablestack, mountpoint);
 					if (st->client_version == 2 && (!st->scheme_basic || !st->user || !st->password)) {
 						err = 401;
 						break;
@@ -735,7 +734,10 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						err = 401;
 						break;
 					}
-					if (!sourceline && r != CHECKPW_MOUNTPOINT_WILDCARD) {
+					struct sourceline *sourceline = stack_find_local_mountpoint(st->caster, &st->caster->sourcetablestack, mountpoint);
+					if (sourceline != NULL) {
+						sourceline_decref(sourceline);
+					} else if (r != CHECKPW_MOUNTPOINT_WILDCARD) {
 						err = 404;
 						break;
 					}
@@ -762,7 +764,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					else
 						ntripsrv_send_stream_result_ok(st, output, NULL, NULL);
 					struct timeval read_timeout = { config->source_read_timeout, 0 };
-					st->state = NTRIP_WAIT_STREAM_SOURCE;
+					ntrip_set_state(st, NTRIP_WAIT_STREAM_SOURCE);
 					joblist_append_ntrip_locked(st->caster->joblist, st, ntrip_set_rtcm_cache);
 					bufferevent_set_timeouts(bev, &read_timeout, NULL);
 				} else {
@@ -770,7 +772,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					break;
 				}
 			}
-		} else if (st->state == NTRIP_WAIT_CLIENT_INPUT) {
+		} else if (ntrip_get_state(st) == NTRIP_WAIT_CLIENT_INPUT) {
 			line = evbuffer_readln(st->input, &len, EVBUFFER_EOL_CRLF);
 			if (!line)
 				break;
@@ -783,7 +785,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 				joblist_append_ntrip_locked(st->caster->joblist, st, &ntripsrv_redo_virtual_pos_limited);
 			} else
 				ntrip_log(st, LOG_DEBUG, "BAD GGA \"%s\", %zd bytes", line, len);
-		} else if (st->state == NTRIP_WAIT_CLIENT_CONTENT) {
+		} else if (ntrip_get_state(st) == NTRIP_WAIT_CLIENT_CONTENT) {
 			int len;
 			len = evbuffer_remove(st->input, st->content+st->content_done, st->content_length-st->content_done);
 			if (len <= 0)
@@ -796,23 +798,23 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					st->type = "adm";
 					admsrv(st, st->http_args[0], "/adm", st->http_args[1] + 4, &err, &opt_headers);
 				}
-				st->state = NTRIP_WAIT_HTTP_METHOD;
+				ntrip_set_state(st, NTRIP_WAIT_HTTP_METHOD);
 			}
-		} else if (st->state == NTRIP_WAIT_STREAM_SOURCE) {
+		} else if (ntrip_get_state(st) == NTRIP_WAIT_STREAM_SOURCE) {
 			if (st->chunk_state == CHUNK_END) {
-				st->state = NTRIP_FORCE_CLOSE;
+				ntrip_set_state(st, NTRIP_FORCE_CLOSE);
 				err = 1;
 				break;
 			}
 			// will increment st->received_bytes itself
 			rtcm_packet_handle(st);
 			break;
-		} else if (st->state == NTRIP_FORCE_CLOSE) {
+		} else if (ntrip_get_state(st) == NTRIP_FORCE_CLOSE) {
 			err = 1;
 			break;
 		} else {
 			/* Catchall for unknown states */
-			st->state = NTRIP_FORCE_CLOSE;
+			ntrip_set_state(st, NTRIP_FORCE_CLOSE);
 			err = 1;
 			break;
 		}
@@ -835,10 +837,10 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 		else if (err >= 100)
 			send_server_reply(st, output, err, &opt_headers, NULL, NULL);
 		ntrip_log(st, LOG_EDEBUG, "ntripsrv_readcb err %d", err);
-		st->state = NTRIP_WAIT_CLOSE;
+		ntrip_set_state(st, NTRIP_WAIT_CLOSE);
 	}
 	evhttp_clear_headers(&opt_headers);
-	if (st->state == NTRIP_FORCE_CLOSE)
+	if (ntrip_get_state(st) == NTRIP_FORCE_CLOSE)
 		ntrip_decref_end(st, "ntripsrv_readcb");
 }
 
@@ -851,7 +853,7 @@ void ntripsrv_writecb(struct bufferevent *bev, void *arg)
 {
 	struct ntrip_state *st = (struct ntrip_state *)arg;
 
-	if (st->state == NTRIP_WAIT_CLOSE) {
+	if (ntrip_get_state(st) == NTRIP_WAIT_CLOSE) {
 		size_t len;
 		struct evbuffer *output;
 		output = bufferevent_get_output(bev);
@@ -890,10 +892,10 @@ void ntripsrv_eventcb(struct bufferevent *bev, short events, void *arg)
 			 * Special case for NTRIP clients: in case of a read timeout, check whether we have been
 			 * recently sending data.
 			 */
-			if (st->state == NTRIP_WAIT_CLIENT_INPUT) {
+			if (ntrip_get_state(st) == NTRIP_WAIT_CLIENT_INPUT) {
 				int idle_time = time(NULL) - st->last_send;
 				if (idle_time <= config->idle_max_delay) {
-					/* Reenable read */
+					/* Re-enable read */
 					bufferevent_enable(bev, EV_READ);
 					return;
 				}
@@ -919,7 +921,7 @@ void ntripsrv_eventcb(struct bufferevent *bev, short events, void *arg)
 }
 
 /*
- * Stub fonctions needed in threaded mode to send jobs to a worker queue,
+ * Stub functions needed in threaded mode to send jobs to a worker queue,
  * as the main libevent loop can't be multithreaded.
  */
 void ntripsrv_workers_readcb(struct bufferevent *bev, void *arg) {
@@ -942,7 +944,7 @@ void ntripsrv_listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 {
 	struct listener *listener_conf = arg;
 	struct caster_state *caster = listener_conf->caster;
-	struct event_base *base = caster->base;
+	struct event_base *base = caster_get_eventbase(caster);
 	struct bufferevent *bev;
 	SSL *ssl = NULL;
 
@@ -955,9 +957,9 @@ void ntripsrv_listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		}
 
 		if (threads)
-			bev = bufferevent_openssl_socket_new(caster->base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
+			bev = bufferevent_openssl_socket_new(caster_get_eventbase(caster), fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
 		else
-			bev = bufferevent_openssl_socket_new(caster->base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE);
+			bev = bufferevent_openssl_socket_new(caster_get_eventbase(caster), fd, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE);
 	} else {
 		if (threads)
 			bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
@@ -985,16 +987,18 @@ void ntripsrv_listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	ntrip_set_peeraddr(st, sa, socklen);
 	ntrip_set_localaddr(st);
 
-	st->state = NTRIP_WAIT_HTTP_METHOD;
+	ntrip_set_state(st, NTRIP_WAIT_HTTP_METHOD);
 
+	ntrip_incref(st, "ntripsrv_listener_cb");
 	if (ntrip_register_check(st) < 0) {
+		ntrip_decref(st, "ntripsrv_listener_cb");
 		ntrip_decref_end(st, "ntripsrv_listener_cb");
 		return;
 	}
 
 	ntrip_log(st, LOG_INFO, "New connection");
 
-	// evbuffer_defer_callbacks(bufferevent_get_output(bev), st->caster->base);
+	// evbuffer_defer_callbacks(bufferevent_get_output(bev), caster_get_eventbase(caster);
 
 	if (threads)
 		bufferevent_setcb(bev, ntripsrv_workers_readcb, ntripsrv_workers_writecb, ntripsrv_workers_eventcb, st);
@@ -1004,4 +1008,5 @@ void ntripsrv_listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	struct timeval read_timeout = { st->config->ntripsrv_default_read_timeout, 0 };
 	struct timeval write_timeout = { st->config->ntripsrv_default_write_timeout, 0 };
 	bufferevent_set_timeouts(bev, &read_timeout, &write_timeout);
+	ntrip_decref(st, "ntripsrv_listener_cb");
 }

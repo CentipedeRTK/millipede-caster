@@ -1,6 +1,5 @@
 #include "conf.h"
 
-#include <assert.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,7 +55,7 @@ struct sourcetable *sourcetable_read(struct caster_state *caster, const char *fi
 		if (_sourcetable_add_unlocked(tmp_sourcetable, line, 0, caster) < 0) {
 			logfmt(&caster->flog, LOG_ERR, "Can't parse line %d in sourcetable", nlines);
 			strfree(line);
-			sourcetable_free(tmp_sourcetable);
+			sourcetable_decref(tmp_sourcetable);
 			fclose(fp);
 			return NULL;
 		}
@@ -109,7 +108,7 @@ static struct sourcetable *sourcetable_from_json(json_object *j, struct caster_s
 		const char *str = json_object_get_string(json_object_object_get(source, "str"));
 
 		if (str == NULL || _sourcetable_add_unlocked(tmp_sourcetable, str, tmp_sourcetable->pullable, caster) < 0) {
-			sourcetable_free(tmp_sourcetable);
+			sourcetable_decref(tmp_sourcetable);
 			tmp_sourcetable = NULL;
 			break;
 		}
@@ -122,7 +121,7 @@ struct sourcetable *sourcetable_new(const char *host, unsigned short port, int t
 	struct sourcetable *this = (struct sourcetable *)malloc(sizeof(struct sourcetable));
 	char *duphost = (host == NULL) ? NULL : mystrdup(host);
 	char *header = mystrdup("");
-	struct hash_table *kv = hash_table_new(509, (void (*)(void *))sourceline_free);
+	struct hash_table *kv = hash_table_new(509, (void (*)(void *))sourceline_decref);
 	if ((host != NULL && duphost == NULL) || header == NULL || this == NULL || kv == NULL) {
 		strfree(duphost);
 		strfree(header);
@@ -144,10 +143,11 @@ struct sourcetable *sourcetable_new(const char *host, unsigned short port, int t
 	this->fetch_time = t;
 	this->nvirtual = 0;
 	this->tls = tls;
+	atomic_store(&this->refcnt, 1);
 	return this;
 }
 
-void sourcetable_free(struct sourcetable *this) {
+static void sourcetable_free(struct sourcetable *this) {
 	strfree(this->header);
 	strfree(this->caster);
 	strfree((char *)this->filename);
@@ -156,6 +156,15 @@ void sourcetable_free(struct sourcetable *this) {
 
 	P_RWLOCK_DESTROY(&this->lock);
 	free(this);
+}
+
+void sourcetable_incref(struct sourcetable *this) {
+	atomic_fetch_add(&this->refcnt, 1);
+}
+
+void sourcetable_decref(struct sourcetable *this) {
+	if (atomic_fetch_add_explicit(&this->refcnt, -1, memory_order_relaxed) == 1)
+		sourcetable_free(this);
 }
 
 /*
@@ -248,8 +257,11 @@ json_object *sourcetable_json(struct sourcetable *this) {
 static int _sourcetable_add_direct(struct sourcetable *this, struct sourceline *s) {
 	int r;
 	r = hash_table_add(this->key_val, s->key, s);
-	if (s->virtual)
-		this->nvirtual++;
+	if (r >= 0) {
+		sourceline_incref(s);
+		if (s->virtual)
+			this->nvirtual++;
+	}
 	return r;
 }
 
@@ -264,9 +276,11 @@ static int _sourcetable_add_unlocked(struct sourcetable *this, const char *sourc
 			return -1;
 		}
 		r = _sourcetable_add_direct(this, n1);
+		sourceline_decref(n1);
 		if (r < 0) {
-			logfmt(&caster->flog, LOG_ERR, "Can't add sourcetable line (possibly duplicate key): %s", sourcetable_entry);
-			sourceline_free(n1);
+			logfmt(&caster->flog, LOG_ERR, "Can't add sourcetable line (%s): %s",
+				(r == -1)?"duplicate key":"out of memory",
+				sourcetable_entry);
 		}
 	} else {
 		int new_len = strlen(this->header) + strlen(sourcetable_entry) + 3;
@@ -451,6 +465,8 @@ struct sourceline *sourcetable_find_mountpoint(struct sourcetable *this, char *m
 
 	P_RWLOCK_RDLOCK(&this->lock);
 	result = (struct sourceline *)hash_table_get(this->key_val, mountpoint);
+	if (result != NULL)
+		sourceline_incref(result);
 	P_RWLOCK_UNLOCK(&this->lock);
 
 	return result;
@@ -511,6 +527,7 @@ static struct sourceline *_stack_find_mountpoint(struct caster_state *caster, so
 			r = np;
 			break;
 		}
+		sourceline_decref(np);
 	}
 
 	P_RWLOCK_UNLOCK(&stack->lock);
@@ -543,7 +560,10 @@ struct sourceline *stack_find_pullable(sourcetable_stack_t *stack, char *mountpo
 		if (s->pullable) {
 			struct sourceline *np = sourcetable_find_mountpoint(s, mountpoint);
 			if (np) {
-				if (sourcetable) *sourcetable = s;
+				if (sourcetable) {
+					sourcetable_incref(s);
+					*sourcetable = s;
+				}
 				r = np;
 				break;
 			}
@@ -583,13 +603,11 @@ static void _stack_replace(struct caster_state *caster, sourcetable_stack_t *sta
 			P_RWLOCK_UNLOCK(&r->lock);
 			if (new_sourcetable != NULL)
 				sourcetable_diff(caster, r, new_sourcetable);
-			sourcetable_free(r);
+			sourcetable_decref(r);
 		} else {
 			P_RWLOCK_UNLOCK(&r->lock);
-			if (new_sourcetable != NULL) {
-				sourcetable_free(new_sourcetable);
+			if (new_sourcetable != NULL)
 				new_sourcetable = NULL;
-			}
 		}
 	}
 	if (new_sourcetable != NULL) {
@@ -598,6 +616,7 @@ static void _stack_replace(struct caster_state *caster, sourcetable_stack_t *sta
 		 */
 		if (local)
 			logfmt(&caster->flog, LOG_INFO, "Reloading %s", new_sourcetable->filename);
+		sourcetable_incref(new_sourcetable);
 		TAILQ_FOREACH(s, &stack->list, next) {
 			if (new_sourcetable->priority >= s->priority) {
 				TAILQ_INSERT_BEFORE(s, new_sourcetable, next);
@@ -671,7 +690,6 @@ struct sourcetable *stack_flatten_dist(struct caster_state *caster, sourcetable_
 				continue;
 
 			struct element *e = hash_table_get_element(r->key_val, sp->key);
-			struct sourceline *mp;
 
 			if (e == NULL) {
 				/*
@@ -679,13 +697,11 @@ struct sourcetable *stack_flatten_dist(struct caster_state *caster, sourcetable_
 				 * add it if within maximum distance.
 				 */
 				if (!pos || distance(&sp->pos, pos) < max_dist) {
-					mp = sourceline_copy(sp);
-					if (mp == NULL) {
+					if (_sourcetable_add_direct(r, sp) < 0) {
 						P_RWLOCK_UNLOCK(&s->lock);
 						P_RWLOCK_UNLOCK(&this->lock);
 						goto cancel;
 					}
-					_sourcetable_add_direct(r, mp);
 				}
 			}
 		}
@@ -744,6 +760,7 @@ int sourcetable_update_execute(struct caster_state *caster, json_object *j) {
 	if (s != NULL) {
 		logfmt(&caster->flog, LOG_DEBUG, "received sourcetable for %s", s->caster);
 		_stack_replace(caster, &caster->sourcetablestack, s->caster, s->port, s, 1, 0);
+		sourcetable_decref(s);
 	}
 	return 200;
 }

@@ -30,7 +30,8 @@ static void livesource_end(struct livesource *this);
 static void _livesource_del_subscriber_unlocked(struct ntrip_state *st);
 static json_object *livesource_update_json(struct livesource *this,
 	struct caster_state *caster, enum livesource_update_type utype);
-static struct livesource *livesource_find_unlocked(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, int sourceline_on_demand, enum livesource_state *new_state, json_object **jp);
+static struct livesource *livesource_find_unlocked(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos,
+	int find_on_demand, int create_on_demand, int sourceline_on_demand, enum livesource_state *new_state, json_object **jp);
 
 /*
  * Create a remote livesource record
@@ -227,7 +228,7 @@ void livesource_add_subscriber(struct ntrip_state *st, struct livesource *this, 
 		sub->backlogged = 0;
 
 		bufferevent_lock(st->bev);
-		int cancel = (st->state == NTRIP_END);
+		int cancel = (ntrip_get_state(st) == NTRIP_END);
 		if (!cancel) {
 			int *virtual = (int *)arg1;
 			assert(st->subscription == NULL);
@@ -307,20 +308,21 @@ int livesource_send_subscribers(struct livesource *this, struct packet *packet, 
 	this->npackets++;
 
 	int nbacklogged = 0;
+	size_t backlog_evbuffer = atomic_load(&caster->backlog_evbuffer);
 
 	TAILQ_FOREACH(np, &this->subscribers, next) {
 		struct ntrip_state *st = np->ntrip_state;
 		struct bufferevent *bev = st->bev;
 		bufferevent_lock(bev);
-		if (st->state == NTRIP_END) {
+		if (ntrip_get_state(st) == NTRIP_END) {
 			/* Subscriber currently closing, skip */
-			ntrip_log(st, LOG_DEBUG, "livesource_send_subscribers: dropping, state=%d", st->state);
+			ntrip_log(st, LOG_DEBUG, "livesource_send_subscribers: dropping, state=%d", ntrip_get_state(st));
 			bufferevent_unlock(bev);
 			n++;
 			continue;
 		}
 		size_t backlog_len = evbuffer_get_length(bufferevent_get_output(st->bev));
-		if (backlog_len > st->config->backlog_evbuffer) {
+		if (backlog_len > backlog_evbuffer) {
 			ntrip_log(st, LOG_NOTICE, "RTCM: backlog len %ld on output for %s", backlog_len, this->mountpoint);
 			np->backlogged = 1;
 			nbacklogged++;
@@ -328,16 +330,16 @@ int livesource_send_subscribers(struct livesource *this, struct packet *packet, 
 			n++;
 			continue;
 		}
-		if (st->rtcm_client_state == NTRIP_RTCM_POS_WAIT) {
+		if (atomic_load(&st->rtcm_client_state) == NTRIP_RTCM_POS_WAIT) {
 			if (!is_pos) {
 				bufferevent_unlock(bev);
 				n++;
 				continue;
 			}
-			st->rtcm_client_state = NTRIP_RTCM_POS_OK;
+			atomic_store(&st->rtcm_client_state, NTRIP_RTCM_POS_OK);
 		}
 		p = packet;
-		if (st->rtcm_filter && !rtcm_filter_pass(st->config->dyn->rtcm_filter, packet)) {
+		if (atomic_load(&st->use_rtcm_filter) && !rtcm_filter_pass(st->config->dyn->rtcm_filter, packet)) {
 			if (!pconv)
 				pconv = rtcm_filter_convert(st->config->dyn->rtcm_filter, st, packet);
 			p = pconv;
@@ -407,7 +409,7 @@ int livesource_connected(struct ntrip_state *st, char *mountpoint) {
 	 * since we are not a source subscriber.
 	 */
 	P_RWLOCK_WRLOCK(&st->caster->livesources->lock);
-	existing_livesource = livesource_find_unlocked(st->caster, st, mountpoint, NULL, 0, 0, NULL, NULL);
+	existing_livesource = livesource_find_unlocked(st->caster, st, mountpoint, NULL, 1, 0, 0, NULL, NULL);
 	if (existing_livesource) {
 		/* Here, we should perphaps destroy & replace any existing source fetcher. */
 		P_RWLOCK_UNLOCK(&st->caster->livesources->lock);
@@ -421,9 +423,10 @@ int livesource_connected(struct ntrip_state *st, char *mountpoint) {
 	}
 	int e = hash_table_add(st->caster->livesources->hash, mountpoint, np);
 	if (e != 0) {
+		assert(e != -1);
 		P_RWLOCK_UNLOCK(&st->caster->livesources->lock);
 		livesource_decref(np);
-		ntrip_log(st, LOG_ERR, "Can't register livesource %s: already found", st->mountpoint);
+		ntrip_log(st, LOG_ERR, "Can't register livesource %s: out of memory", st->mountpoint);
 		return -1;
 	}
 	// count 1 reference for the hash table above, in addition
@@ -467,7 +470,8 @@ static int livesource_find_remote_endpoint(struct caster_state *this, struct ntr
  * Required lock (read): livesource list.
  */
 static struct livesource *livesource_find_unlocked(struct caster_state *this, struct ntrip_state *st,
-		char *mountpoint, pos_t *mountpoint_pos, int on_demand, int sourceline_on_demand, enum livesource_state *new_state, json_object **jp) {
+		char *mountpoint, pos_t *mountpoint_pos, int find_on_demand, int create_on_demand, int sourceline_on_demand,
+		enum livesource_state *new_state, json_object **jp) {
 	struct livesource *np;
 	struct livesource *result = NULL;
 
@@ -477,10 +481,10 @@ static struct livesource *livesource_find_unlocked(struct caster_state *this, st
 	np = (struct livesource *)hash_table_get(this->livesources->hash, mountpoint);
 
 	if (np && (np->state == LIVESOURCE_RUNNING
-			    || (on_demand && np->state == LIVESOURCE_FETCH_PENDING)))
+			    || (find_on_demand && np->state == LIVESOURCE_FETCH_PENDING)))
 		result = np;
 
-	if (result == NULL && on_demand && st) {
+	if (result == NULL && find_on_demand && create_on_demand && st) {
 		int re = 0;
 		struct endpoint e;
 		endpoint_init(&e, NULL, 0, 0);
@@ -492,7 +496,13 @@ static struct livesource *livesource_find_unlocked(struct caster_state *this, st
 		if (np == NULL) {
 			return NULL;
 		}
-		hash_table_add(this->livesources->hash, mountpoint, np);
+		int r = hash_table_add(this->livesources->hash, mountpoint, np);
+		if (r == -2) {
+			/* Out of memory */
+			livesource_free(np);
+			return NULL;
+		}
+		assert(r != -1);
 		if (*jp)
 			*jp = livesource_update_json(np, this, LIVESOURCE_UPDATE_ADD);
 		this->livesources->serial++;
@@ -518,9 +528,16 @@ static struct livesource *livesource_find_unlocked(struct caster_state *this, st
  */
 struct livesource *livesource_find_on_demand(struct caster_state *this, struct ntrip_state *st, char *mountpoint, pos_t *mountpoint_pos, int on_demand, int sourceline_on_demand, enum livesource_state *new_state) {
 	json_object *j;
-	P_RWLOCK_RDLOCK(&this->livesources->lock);
-	struct livesource *result = livesource_find_unlocked(this, st, mountpoint, mountpoint_pos, on_demand, sourceline_on_demand, new_state, &j);
+
+	if (on_demand) {
+		/* Get a write lock as we may have to create a new entry */
+		P_RWLOCK_WRLOCK(&this->livesources->lock);
+	} else {
+		P_RWLOCK_RDLOCK(&this->livesources->lock);
+	}
+	struct livesource *result = livesource_find_unlocked(this, st, mountpoint, mountpoint_pos, on_demand, on_demand, sourceline_on_demand, new_state, &j);
 	P_RWLOCK_UNLOCK(&this->livesources->lock);
+
 	syncer_queue_json(this, j);
 	return result;
 }
@@ -731,6 +748,7 @@ static int livesource_update_execute_diff(struct caster_state *caster, struct li
 	struct json_object *jserial = json_object_object_get(j, "serial");
 	struct json_object *jstart_date = json_object_object_get(j, "start_date");
 	const char *type = json_object_get_string(json_object_object_get(j, "type"));
+	int r;
 
 	if (type == NULL || jserial == NULL || jstart_date == NULL)
 		return 503;
@@ -776,7 +794,14 @@ static int livesource_update_execute_diff(struct caster_state *caster, struct li
 		const char *lsstate = json_object_get_string(json_object_object_get(ls, "state"));
 		lr->state = convert_state(lsstate);
 		lr->type = convert_type(lstype);
-		hash_table_add(lrlist->hash, mountpoint, lr);
+		r = hash_table_add(lrlist->hash, mountpoint, lr);
+		assert(r != -1);
+		if (r == -2) {
+			/* Out of memory */
+			livesource_remote_free(lr);
+			logfmt(&caster->flog, LOG_CRIT, "update failed on mountpoint %s: out of memory", mountpoint);
+			return 503;
+		}
 	} else if (!strcmp(type, "del")) {
 		if (!lr) {
 			logfmt(&caster->flog, LOG_NOTICE, "update failed: %s does not exist", mountpoint);
@@ -841,8 +866,12 @@ static struct livesources_remote *livesource_process_fulltable(struct caster_sta
 		lr->state = convert_state(lsstate);
 		lr->type = convert_type(lstype);
 
-		hash_table_add(remote->hash, mountpoint, lr);
-
+		int r = hash_table_add(remote->hash, mountpoint, lr);
+		assert(r != -1);
+		if (r == -2) {
+			logfmt(&caster->flog, LOG_WARNING, "duplicate mountpoint %s in livesource table, ignoring", mountpoint);
+			livesource_remote_free(lr);
+		}
 		json_object_iter_next(&it);
 	}
 	return remote;
@@ -852,18 +881,25 @@ static struct livesources_remote *livesource_process_fulltable(struct caster_sta
  * Replace a livesources_remote table, or remove if new_remote == NULL.
  */
 void livesources_remote_replace(struct caster_state *caster, const char *hostname, struct livesources_remote *new_remote) {
+	int r = 0;
 	P_RWLOCK_WRLOCK(&caster->livesources->lock);
 	struct livesources_remote *e = (struct livesources_remote *)hash_table_get_del(caster->livesources->remote, hostname);
 	if (new_remote != NULL)
-		hash_table_add(caster->livesources->remote, hostname, new_remote);
+		r = hash_table_add(caster->livesources->remote, hostname, new_remote);
 	P_RWLOCK_UNLOCK(&caster->livesources->lock);
 	if (e != NULL)
 		/* Do this here to reduce locking time */
 		livesources_remote_free(e);
+	assert(r != -1);
 	if (new_remote != NULL)
 		node_set_state(caster->nodes, hostname, NODE_UP);
 	else
 		node_set_state(caster->nodes, hostname, NODE_DOWN);
+	if (r == -2 && new_remote != NULL) {
+		/* Out of memory */
+		logfmt(&caster->flog, LOG_CRIT, "update failed on hostname %s: out of memory", hostname);
+		livesources_remote_free(new_remote);
+	}
 }
 
 /*

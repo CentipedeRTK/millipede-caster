@@ -122,6 +122,7 @@ redistribute_source_stream(struct redistribute_cb_args *this) {
 			redistribute_args_free(this);
 			return;
 		}
+		sourceline_decref(s);
 		host = sp->caster;
 		port = sp->port;
 		tls = sp->tls;
@@ -135,6 +136,8 @@ redistribute_source_stream(struct redistribute_cb_args *this) {
 	this->task->host = mystrdup(host);
 	strfree((char *)this->task->uri);
 	this->task->uri = mystrdup(this->uri);
+	if (sp != NULL)
+		sourcetable_decref(sp);
 
 	if (this->task->host == NULL || this->task->uri == NULL) {
 		strfree(this->task->host);

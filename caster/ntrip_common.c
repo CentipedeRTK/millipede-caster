@@ -47,7 +47,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->sent_bytes = 0;
 
 	this->caster = caster;
-	this->state = NTRIP_INIT;
+	ntrip_set_state(this, NTRIP_INIT);
 	this->chunk_state = CHUNK_NONE;
 	this->chunk_buf = NULL;
 	this->port = port;
@@ -114,8 +114,8 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->query_string = NULL;
 	this->content_type = NULL;
 	this->client = 0;
-	this->rtcm_filter = 0;
-	this->rtcm_client_state = NTRIP_RTCM_POS_WAIT;
+	atomic_store(&this->use_rtcm_filter, 0);
+	atomic_store(&this->rtcm_client_state, NTRIP_RTCM_POS_WAIT);
 	this->node = NULL;
 	this->syncer_id = NULL;
 
@@ -132,7 +132,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
  */
 struct config *ntrip_refresh_config(struct ntrip_state *this) {
 	struct config *config = this->tmpconfig?this->tmpconfig:this->config;
-	if (this->tmpconfig && this->tmpconfig != this->config) {
+	if (this->tmpconfig && this->tmpconfig != this->config && this->tmpconfig->gen > this->config->gen) {
 		config_incref(this->tmpconfig);
 		config_decref(this->config);
 		this->config = config;
@@ -448,7 +448,7 @@ void ntrip_incref(struct ntrip_state *this, char *orig) {
  */
 void ntrip_decref(struct ntrip_state *this, char *orig) {
 	if (atomic_fetch_sub(&this->refcnt, 1) == 1) {
-		assert(this->state == NTRIP_END);
+		assert(ntrip_get_state(this) == NTRIP_END);
 		ntrip_deferred_free(this, orig);
 	}
 }
@@ -459,11 +459,11 @@ void ntrip_decref(struct ntrip_state *this, char *orig) {
  * Required lock: ntrip_state
  */
 void ntrip_decref_end(struct ntrip_state *this, char *orig) {
-	if (this->state == NTRIP_END) {
+	if (ntrip_get_state(this) == NTRIP_END) {
 		ntrip_log(this, LOG_EDEBUG, "double call to ntrip_deferred_free from %s", orig);
 		return;
 	}
-	this->state = NTRIP_END;
+	ntrip_set_state(this, NTRIP_END);
 
 	/*
 	 * Unregister all we can right now.
@@ -482,7 +482,7 @@ void ntrip_decref_end(struct ntrip_state *this, char *orig) {
 
 	size_t remain = evbuffer_get_length(bufferevent_get_output(bev));
 	if (remain) {
-		ntrip_log(this, LOG_DEBUG, "Warning: potentiel evbuffer leak, %ld bytes remaining", remain);
+		ntrip_log(this, LOG_DEBUG, "Warning: potential evbuffer leak, %ld bytes remaining", remain);
 		evbuffer_drain(bufferevent_get_output(bev), remain);
 	}
 	ntrip_decref(this, orig);
@@ -675,7 +675,7 @@ _ntrip_log(struct log *log, struct ntrip_state *this, int level, const char *fmt
 	gelf_init(&g, level, this->caster->hostname, thread_id);
 	g.connection_id = this->id;
 
-	if (this->caster->graylog_log_level == -1
+	if (atomic_load(&this->caster->graylog_log_level) == -1
 		|| (this->config->dyn->graylog && this->config->dyn->graylog[0] && this->task && this->task->nograylog))
 		g.nograylog = 1;
 
@@ -779,7 +779,7 @@ static enum bufferevent_filter_result ntrip_chunk_decode(struct evbuffer *input,
 			if (sscanf(line, "%zx", &chunk_len) != 1) {
 				ntrip_log(st, LOG_NOTICE, "failed chunk_len: \"%s\"", line);
 				free(line);
-				st->state = NTRIP_FORCE_CLOSE;
+				ntrip_set_state(st, NTRIP_FORCE_CLOSE);
 				st->chunk_state = CHUNK_NONE;
 				ntrip_log(st, LOG_EDEBUG, "ntrip_chunk_decode OK/ERROR done %d", len_done);
 				return len_done?BEV_OK:BEV_ERROR;
@@ -862,7 +862,12 @@ void ntrip_set_rtcm_cache(struct ntrip_state *st) {
 	rp = hash_table_get(st->caster->rtcm_cache, st->mountpoint);
 	if (rp == NULL) {
 		rp = rtcm_info_new();
-		hash_table_add(st->caster->rtcm_cache, st->mountpoint, rp);
+		int e = hash_table_add(st->caster->rtcm_cache, st->mountpoint, rp);
+		assert(e != -1);
+		if (e == -2) {
+			/* Out of memory */
+			rtcm_info_free(rp);
+		}
 	}
 	st->rtcm_info = rp;
 	P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
