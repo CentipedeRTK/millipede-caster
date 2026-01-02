@@ -24,9 +24,9 @@ static inline void rtcm_typeset_init(struct rtcm_typeset *this) {
  */
 static inline int rtcm_typeset_check(struct rtcm_typeset *this, int type) {
 	if (type >= RTCM_1K_MIN && type <= RTCM_1K_MAX)
-		return getbit(this->set1k, type-RTCM_1K_MIN);
+		return getbit_atomic(this->set1k, type-RTCM_1K_MIN);
 	if (type >= RTCM_4K_MIN && type <= RTCM_4K_MAX)
-		return getbit(this->set4k, type-RTCM_4K_MIN);
+		return getbit_atomic(this->set4k, type-RTCM_4K_MIN);
 	return 0;
 }
 
@@ -35,10 +35,10 @@ static inline int rtcm_typeset_check(struct rtcm_typeset *this, int type) {
  */
 static inline int rtcm_typeset_set(struct rtcm_typeset *this, int type) {
 	if (type >= RTCM_1K_MIN && type <= RTCM_1K_MAX) {
-		setbit(this->set1k, type-RTCM_1K_MIN);
+		setbit_atomic(this->set1k, type-RTCM_1K_MIN);
 		return 0;
 	} else if (type >= RTCM_4K_MIN && type <= RTCM_4K_MAX) {
-		setbit(this->set4k, type-RTCM_4K_MIN);
+		setbit_atomic(this->set4k, type-RTCM_4K_MIN);
 		return 0;
 	}
 	return -1;
@@ -371,7 +371,7 @@ static unsigned int rtcm_df407_to_df402(unsigned int df407) {
 /*
  * Convert MSM7 message to MSM3 or MSM4.
  */
-static struct packet *rtcm_convert_msm7(struct ntrip_state *st, struct packet *p, int msm_version) {
+struct packet *rtcm_convert_msm7(struct packet *p, int msm_version) {
 	unsigned char *data = p->data+3;
 	int len = p->datalen-6;
 	unsigned char *data_rtcm, *data_out;
@@ -384,11 +384,11 @@ static struct packet *rtcm_convert_msm7(struct ntrip_state *st, struct packet *p
 	unsigned short df407;
 	uint64_t df394, df396;
 	uint32_t df395;
-	char df393;
+	//char df393;
 	int n;
 	int nsat, nsig, ncell;
 
-	int type = getbits(data, 0, 12);
+	int type = rtcm_get_type(p);
 	if ((type < 1077 || type > 1127 || type % 10 != 7) || len < 22)
 		/* Invalid packet type or length, or too short */
 		return NULL;
@@ -399,7 +399,7 @@ static struct packet *rtcm_convert_msm7(struct ntrip_state *st, struct packet *p
 	int pos = 12 + 12 + 30;
 
 	/* Multiple Message Bit */
-	df393 = getbit(data, pos);
+	//df393 = getbit(data, pos);
 
 	// Skip IODS, Reserved field, Clock Steering Indicator, External Clock Indicator,
 	// GNSS Divergence-free Smoothing Indicator, GNSS Smoothing Interval.
@@ -422,10 +422,8 @@ static struct packet *rtcm_convert_msm7(struct ntrip_state *st, struct packet *p
 
 	int endcell = pos + nsat*nsig;
 
-	if (endcell > len*8) {
-		ntrip_log(st, LOG_EDEBUG, "packet nsat=%d nsig=%d endcell %d len %d not long enough", nsat, nsig, endcell, len*8);
+	if (endcell > len*8)
 		return NULL;
-	}
 
 	/* GNSS Cell Mask */
 	df396 = getbits(data, pos, nsat*nsig);
@@ -433,13 +431,8 @@ static struct packet *rtcm_convert_msm7(struct ntrip_state *st, struct packet *p
 	ncell = count_set(df396);
 
 	int endpos = pos + (8+4+10+14)*nsat + (20+24+10+1+10+15)*ncell;
-	if (endpos > len*8) {
-		ntrip_log(st, LOG_EDEBUG, "packet nsat=%d nsig=%d end %d len %d not long enough", nsat, nsig, endpos, len*8);
+	if (endpos > len*8)
 		return NULL;
-	}
-
-	ntrip_log(st, LOG_EDEBUG, "type %d MM=%d nsat=%d nsig=%d ncell=%d sat %016lx sig %08x cell %016lx",
-			type, df393, nsat, nsig, ncell, df394, df395, df396);
 
 	if (msmv == 4)
 		len_out_bits = 169 + (8+10+nsig)*nsat + (15+22+4+1+6)*ncell;
@@ -571,8 +564,7 @@ int rtcm_filter_pass(struct rtcm_filter *this, struct packet *packet) {
 	if (!packet->is_rtcm)
 		return 0;
 
-	unsigned char *d = packet->data;
-	unsigned short type = getbits(d+3, 0, 12);
+	unsigned short type = rtcm_get_type(packet);
 	return rtcm_typeset_check(&this->pass, type);
 }
 
@@ -585,16 +577,22 @@ struct packet *rtcm_filter_convert(struct rtcm_filter *this, struct ntrip_state 
 	if (this == NULL)
 		return NULL;
 
-	unsigned char *d = packet->data;
-	unsigned short type = getbits(d+3, 0, 12);
+	unsigned short type = rtcm_get_type(packet);
 
 	if (!rtcm_typeset_check(&this->convert, type))
 		return NULL;
 
-	if (this->conversion == RTCM_CONV_MSM7_4)
-		return rtcm_convert_msm7(st, packet, 4);
-	else if (this->conversion == RTCM_CONV_MSM7_3)
-		return rtcm_convert_msm7(st, packet, 3);
+	struct packet *p;
+	if (this->conversion == RTCM_CONV_MSM7_4) {
+		p = rtcm_convert_msm7(packet, 4);
+		if (p == NULL)
+			ntrip_log(st, LOG_NOTICE, "Unable to convert MSM7 packet to MSM4");
+	} else if (this->conversion == RTCM_CONV_MSM7_3) {
+		p = rtcm_convert_msm7(packet, 3);
+		if (p == NULL)
+			ntrip_log(st, LOG_NOTICE, "Unable to convert MSM7 packet to MSM3");
+	} else
+		p = NULL;
 	return NULL;
 }
 
@@ -721,12 +719,6 @@ int rtcm_filter_check_mountpoint(struct caster_dynconfig *dyn, const char *mount
 	return hash_table_get_element(dyn->rtcm_filter_dict, mountpoint) != NULL;
 }
 
-static void handle_1006(struct rtcm_info *rp, struct packet *p) {
-	handle_1005_1006(rp, 1006, p);
-	// d += 3;
-	// unsigned short antenna_height = getbits(d, 152, 16);
-}
-
 /*
  * Return the RTCM cache as a JSON object.
  */
@@ -760,18 +752,17 @@ json_object *rtcm_info_json(struct rtcm_info *this) {
  * Return whether a packet is a position packet (types 1005 or 1006).
  */
 int rtcm_packet_is_pos(struct packet *p) {
-	unsigned char *d = p->data;
 	int len = p->datalen;
 	if (!p->is_rtcm || len < 25)
 		return 0;
-	unsigned short type = getbits(d+3, 0, 12);
+	unsigned short type = rtcm_get_type(p);
 	return (type == 1005 && len == 25) || (type == 1006 && len == 27);
 }
 
 void rtcm_packet_dump(struct ntrip_state *st, struct packet *p) {
 	unsigned char *d = p->data;
 	int len = p->datalen;
-	unsigned short type = getbits(d+3, 0, 12);
+	unsigned short type = rtcm_get_type(p);
 	char *out = (char *)strmalloc(4*len + 1);
 	out[4*len] = '\0';
 	for (int i = 0; i < len; i++)
@@ -780,23 +771,27 @@ void rtcm_packet_dump(struct ntrip_state *st, struct packet *p) {
 	strfree(out);
 }
 
+static void rtcm_handler_pos(struct ntrip_state *st, struct packet *p, void *arg1) {
+	struct rtcm_info *rp = (struct rtcm_info *)arg1;
+
+	unsigned short type = rtcm_get_type(p);
+
+	P_RWLOCK_WRLOCK(&st->caster->rtcm_lock);
+	handle_1005_1006(rp, type, p);
+	P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
+}
+
 static void rtcm_handler(struct ntrip_state *st, struct packet *p, void *arg1) {
 	struct rtcm_info *rp = (struct rtcm_info *)arg1;
 	if (!rp)
 		return;
 
-	unsigned char *d = p->data;
 	int len = p->datalen;
-	unsigned short type = getbits(d+3, 0, 12);
+	unsigned short type = rtcm_get_type(p);
 
-	P_RWLOCK_WRLOCK(&st->caster->rtcm_lock);
 	rtcm_typeset_set(&rp->typeset, type);
-
-	if (type == 1005 && len == 25)
-		handle_1005_1006(rp, 1005, p);
-	else if (type == 1006 && len == 27)
-		handle_1006(rp, p);
-	P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
+	if ((type == 1005 && len == 25) || (type == 1006 && len == 27))
+		joblist_append_ntrip_packet(st->caster->joblist, rtcm_handler_pos, st, p, st->rtcm_info);
 }
 
 /*
@@ -858,10 +853,10 @@ int rtcm_packet_handle(struct ntrip_state *st) {
 
 		if (rtcm_crc_check(rtcmp)) {
 			rtcmp->is_rtcm = 1;
-			unsigned short type = getbits(rtcmp->data+3, 0, 12);
+			unsigned short type = rtcm_get_type(rtcmp);
 			ntrip_log(st, LOG_DEBUG, "RTCM source %s size %d type %d", st->mountpoint, len_rtcm, type);
 			//rtcm_packet_dump(st, rtcmp);
-			joblist_append_ntrip_packet(st->caster->joblist, rtcm_handler, st, rtcmp, st->rtcm_info);
+			rtcm_handler(st, rtcmp, st->rtcm_info);
 		} else
 			ntrip_log(st, LOG_INFO, "RTCM: bad checksum!");
 

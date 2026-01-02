@@ -1,10 +1,12 @@
 #ifndef __RTCM_H__
 #define __RTCM_H__
 
+#include <stdatomic.h>
 #include <sys/time.h>
 
 #include <json-c/json_object.h>
 
+#include "bitfield.h"
 #include "hash.h"
 #include "packet.h"
 
@@ -23,9 +25,9 @@ enum rtcm_conversion {
 
 struct rtcm_typeset {
 	/* bit field for RTCM types 1000-1230 */
-	unsigned char set1k[(RTCM_1K_MAX-RTCM_1K_MIN+8)>>3];
+	_Atomic unsigned char set1k[(RTCM_1K_MAX-RTCM_1K_MIN+8)>>3];
 	/* bit field for RTCM types 4000-4095 */
-	unsigned char set4k[(RTCM_4K_MAX-RTCM_4K_MIN+8)>>3];
+	_Atomic unsigned char set4k[(RTCM_4K_MAX-RTCM_4K_MIN+8)>>3];
 };
 
 struct rtcm_info {
@@ -47,6 +49,7 @@ struct rtcm_filter {
 
 int rtcm_typeset_parse(struct rtcm_typeset *this, const char *typelist);
 char *rtcm_typeset_str(struct rtcm_typeset *this);
+struct packet *rtcm_convert_msm7(struct packet *p, int msm_version);
 struct hash_table *rtcm_filter_dict_parse(struct rtcm_filter *this, const char *apply);
 void rtcm_filter_free(struct rtcm_filter *this);
 struct rtcm_filter *rtcm_filter_new(const char *pass, const char *convert, enum rtcm_conversion conversion);
@@ -59,5 +62,13 @@ struct packet *rtcm_info_pos_packet(struct rtcm_info *this, struct caster_state 
 json_object *rtcm_info_json(struct rtcm_info *this);
 int rtcm_packet_is_pos(struct packet *p);
 int rtcm_packet_handle(struct ntrip_state *st);
+
+/*
+ * Return RTCM packet type, or -1 if not a RTCM packet.
+ */
+static inline unsigned short rtcm_get_type(struct packet *p) {
+	unsigned char *d = p->data;
+	return (p->is_rtcm) ? getbits(d+3, 0, 12) : -1;
+}
 
 #endif
