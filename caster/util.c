@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -430,7 +431,7 @@ void iso_date_from_timeval(char *iso_date, size_t iso_date_len, struct timeval *
 		snprintf(iso_date + 19, 6, ".%03luZ", t->tv_usec/1000);
 }
 
-void timeval_from_iso_date(struct timeval *t, const char *iso_date) {
+int timeval_from_iso_date(struct timeval *t, const char *iso_date) {
 	struct tm date;
 	int tv_usec = 0;
 
@@ -439,7 +440,8 @@ void timeval_from_iso_date(struct timeval *t, const char *iso_date) {
 	int len = strlen(iso_date);
 
 	if (len == 24 && iso_date[19] == '.' && iso_date[23] == 'Z') {
-		strptime(iso_date, "%Y-%m-%dT%H:%M:%S", &date);
+		if (strptime(iso_date, "%Y-%m-%dT%H:%M:%S", &date) == NULL)
+			return 0;
 
 		char cusec[5];
 		memcpy(cusec+1, iso_date+20, 3);
@@ -449,12 +451,15 @@ void timeval_from_iso_date(struct timeval *t, const char *iso_date) {
 		tv_usec = (tv_usec - 1000)*1000;
 
 	} else if (len == 20 && iso_date[19] == 'Z') {
-		strptime(iso_date, "%Y-%m-%dT%H:%M:%SZ", &date);
-	}
+		if (strptime(iso_date, "%Y-%m-%dT%H:%M:%SZ", &date) == NULL)
+			return 0;
+	} else
+		return 0;
 
 	time_t tv_sec = timegm(&date);
 	t->tv_sec = tv_sec;
 	t->tv_usec = tv_usec;
+	return 1;
 }
 
 /*
@@ -467,36 +472,24 @@ void timeval_to_json(struct timeval *t, json_object *json, const char *json_key)
 }
 
 #if DEBUG
-int str_alloc = 0;
-
-static P_MUTEX_T strmutex = PTHREAD_MUTEX_INITIALIZER;
+_Atomic int str_alloc = 0;
 
 char *mystrdup(const char *str) {
-	P_MUTEX_LOCK(&strmutex);
-	str_alloc++;
-	P_MUTEX_UNLOCK(&strmutex);
+	atomic_fetch_add(&str_alloc, 1);
 	return strdup(str);
 }
 void *strmalloc(size_t len) {
-	P_MUTEX_LOCK(&strmutex);
-	str_alloc++;
-	P_MUTEX_UNLOCK(&strmutex);
+	atomic_fetch_add(&str_alloc, 1);
 	return malloc(len);
 }
 void *strrealloc(void *p, size_t len) {
-	if (p == NULL) {
-		P_MUTEX_LOCK(&strmutex);
-		str_alloc++;
-		P_MUTEX_UNLOCK(&strmutex);
-	}
+	if (p == NULL)
+		atomic_fetch_add(&str_alloc, 1);
 	return realloc(p, len);
 }
 void strfree(void *str) {
-	if (str) {
-		P_MUTEX_LOCK(&strmutex);
-		str_alloc--;
-		P_MUTEX_UNLOCK(&strmutex);
-	}
+	if (str)
+		atomic_fetch_sub(&str_alloc, 1);
 	free(str);
 }
 #endif
