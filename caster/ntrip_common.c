@@ -415,7 +415,9 @@ void ntrip_free(struct ntrip_state *this, char *orig) {
 
 static void ntrip_deferred_free2(struct ntrip_state *this) {
 	struct caster_state *caster = this->caster;
+	bufferevent_lock(this->bev);
 	ntrip_log(this, LOG_EDEBUG, "ntrip_deferred_free2");
+	bufferevent_unlock(this->bev);
 
 	P_RWLOCK_WRLOCK(&this->caster->quotalock);
 	ntrip_quota_decr(this);
@@ -444,6 +446,7 @@ static void ntrip_deferred_free2(struct ntrip_state *this) {
  * No lock needed.
  */
 void ntrip_incref(struct ntrip_state *this, char *orig) {
+	assert(this->refcnt > 0);
 	atomic_fetch_add(&this->refcnt, 1);
 }
 
@@ -452,6 +455,7 @@ void ntrip_incref(struct ntrip_state *this, char *orig) {
  * Required lock: ntrip_state
  */
 void ntrip_decref(struct ntrip_state *this, char *orig) {
+	assert(this->refcnt > 0);
 	if (atomic_fetch_sub(&this->refcnt, 1) == 1) {
 		assert(ntrip_get_state(this) == NTRIP_END);
 		ntrip_deferred_free(this, orig);

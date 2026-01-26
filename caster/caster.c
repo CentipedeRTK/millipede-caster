@@ -79,7 +79,7 @@ static void
 caster_log_cb(void *arg, struct gelf_entry *g, int level, const char *fmt, va_list ap) {
 	struct caster_state *this = (struct caster_state *)arg;
 	struct log *log = &this->flog;
-	if (level >= 0 && level <= log->max_log_level)
+	if (level >= 0 && level <= atomic_load(&log->max_log_level))
 		vlogall(this, g, &this->flog, level, fmt, ap);
 }
 
@@ -119,7 +119,7 @@ static void dynconfig_free_fetchers(struct caster_dynconfig *this) {
 	for (int i = 0; i < this->sourcetable_fetchers_count; i++) {
 		if (a[i]) {
 			logfmt(&this->caster->flog, LOG_INFO, "Stopping fetcher %s:%d", a[i]->task->host, a[i]->task->port);
-			fetcher_sourcetable_free(a[i]);
+			fetcher_sourcetable_decref(a[i]);
 		}
 	}
 	free(a);
@@ -885,19 +885,19 @@ static int caster_load(struct caster_state *this, int restart) {
 		r = -1;
 	if (caster_reload_rtcm_filters(this, new_config, newdyn) < 0)
 		r = -1;
+	if (caster_reload_graylog(this, new_config, newdyn) < 0)
+		r = -1;
+	if (caster_reload_syncers(this, new_config, olddyn, newdyn) < 0)
+		r = -1;
+	if (caster_reload_fetchers(this, new_config, olddyn, newdyn) < 0)
+		r = -1;
 
 	P_RWLOCK_WRLOCK(&this->configlock);
 	atomic_store(&this->config, new_config);
 	atomic_store(&this->backlog_evbuffer, new_config->backlog_evbuffer);
 	P_RWLOCK_UNLOCK(&this->configlock);
 
-	if (caster_reload_graylog(this, new_config, newdyn) < 0)
-		r = -1;
 	if (caster_reload_listeners(this, new_config, olddyn, newdyn) < 0)
-		r = -1;
-	if (caster_reload_fetchers(this, new_config, olddyn, newdyn) < 0)
-		r = -1;
-	if (caster_reload_syncers(this, new_config, olddyn, newdyn) < 0)
 		r = -1;
 
 	if (old_config)
@@ -984,8 +984,7 @@ static int caster_reload_fetchers(struct caster_state *this, struct config *new_
 				if (!strcmp(olddyn->sourcetable_fetchers[j]->task->host, new_config->proxy[i].host)
 				&& olddyn->sourcetable_fetchers[j]->task->port == new_config->proxy[i].port) {
 					p = olddyn->sourcetable_fetchers[j];
-					/* Found, clear in the old table */
-					olddyn->sourcetable_fetchers[j] = NULL;
+					fetcher_sourcetable_incref(p);
 					break;
 				}
 			}

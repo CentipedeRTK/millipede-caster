@@ -184,10 +184,11 @@ void ntrip_task_stop(struct ntrip_task *this) {
 
 	if (st) {
 		logfmt(&this->caster->flog, LOG_INFO, "Stopping %s (%p) from %s:%d", this->type, this, this->host, this->port);
-		bufferevent_lock(st->bev);
+		struct bufferevent *bev = st->bev;
+		bufferevent_lock(bev);
 		ntrip_decref_end(st, "ntrip_task_stop");
-		bufferevent_unlock(st->bev);
 		ntrip_decref(st, "ntrip_task_stop 2");
+		bufferevent_unlock(bev);
 	} else
 		logfmt(&this->caster->flog, LOG_INFO, "Stopping %s (%p) from %s:%d: not running", this->type, this, this->host, this->port);
 }
@@ -393,7 +394,6 @@ void ntrip_task_send_next_request(struct ntrip_state *st) {
 			task->pending = 1;
 		}
 	}
-	P_RWLOCK_UNLOCK(&task->mimeq_lock);
 
 	/*
 	 * Only expect a reply from the server if we sent a HTTP request.
@@ -402,6 +402,7 @@ void ntrip_task_send_next_request(struct ntrip_state *st) {
 	 */
 	struct timeval read_timeout = { st->task->pending ? st->task->status_timeout : 0 };
 	bufferevent_set_timeouts(st->bev, &read_timeout, NULL);
+	P_RWLOCK_UNLOCK(&task->mimeq_lock);
 }
 
 /*
@@ -444,10 +445,12 @@ static void ntrip_task_free(struct ntrip_task *this) {
 }
 
 void ntrip_task_incref(struct ntrip_task *this) {
+	assert(this->refcnt > 0);
 	atomic_fetch_add(&this->refcnt, 1);
 }
 
 void ntrip_task_decref(struct ntrip_task *this) {
+	assert(this->refcnt > 0);
 	if (atomic_fetch_add_explicit(&this->refcnt, -1, memory_order_relaxed) == 1)
 		ntrip_task_free(this);
 }
