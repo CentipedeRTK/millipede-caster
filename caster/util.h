@@ -70,8 +70,11 @@ struct mime_content *mime_new(char *s, long long len, const char *mime_type, int
 struct mime_content *mime_new_from_packet(const char *mime_type, struct packet *packet);
 void mime_set_type(struct mime_content *this, const char *mime_type);
 void mime_free(struct mime_content *this);
+struct mime_content *mime_file_read(int fd);
+struct mime_content *mime_file_read_string(int fd);
 char *joinpath(const char *dir, const char *path);
 FILE *fopen_absolute(const char *dir, const char *filename, const char *mode);
+int open_absolute(const char *dir, const char *filename, int flags);
 
 void iso_date_from_timeval(char *iso_date, size_t iso_date_len, struct timeval *t);
 int timeval_from_iso_date(struct timeval *t, const char *iso_date);
