@@ -7,11 +7,14 @@ import sys
 import threading
 import time
 
+# RTCM type 1006 packet to unlock sources in NEAR/V
+rtcm_1006 = b"\xd3\x00\x15\x3e\xe0\x00\x03\x89\xc8\x55\xac\xd7\x80\x71\x2a\x81\xc9\x8b\x20\x8b\x7f\x54\x00\x00\x7c\x4f\x32"
+
 #
 # Source stream to server on a given mountpoint, user+password, number of samples
 #
 class SourceStream(object):
-  def __init__(self, host, mountpoint, userpass, n, start_delay=0, packet_delay=1, packet=None, post=True):
+  def __init__(self, host, mountpoint, userpass, n, start_delay=0, packet_delay=1, packet=None, start_packet=None, post=True):
     self._stop = False
     self._ok = False
     self.host = host
@@ -22,6 +25,7 @@ class SourceStream(object):
     self.start_delay = start_delay
     self.packet_delay = packet_delay
     self.packet = packet
+    self.start_packet = start_packet
     self.post = post
     self.status = None
     self.httpreply = None
@@ -46,6 +50,11 @@ class SourceStream(object):
     self.status = httpreply[1]
     self.httpreply = sdata.split(b'\r', 1)[0]
     self._ok = True
+
+    if self.start_packet:
+      ssource.sendall(self.start_packet)
+      time.sleep(self.packet_delay)
+
     for i in range(self.n):
       if self._stop:
         break
@@ -70,9 +79,11 @@ class ClientStream(object):
     self.host = host
     self.n = n
     self.err = 0
+    self.err_recv = 0
     self.firstline = firstline.encode('ascii')
     self._stop = False
     self.re_expect = None
+    self.ok = 0
   def set_expect(self, re_expect):
     self.re_expect = None if re_expect is None else re.compile(re_expect.encode('ascii'))
   def start(self):
@@ -102,10 +113,11 @@ class ClientStream(object):
         print(".", end='')
       elif self.re_expect.match(data):
         print(".", end='')
+        self.ok += 1
       else:
         print("Got", data)
         print("X", end='')
-        self.err += 1
+        self.err_recv += 1
       sys.stdout.flush()
     if self.n:
       print()
@@ -149,7 +161,7 @@ class SourceServer(object):
     sl.bind(self.host)
     sl.listen(200)
 
-    str_request = b'^GET (/.*) HTTP/1\.[01]'
+    str_request = b'^GET (/.*) HTTP/1\\.[01]'
     self.re_request = re.compile(str_request)
 
     sl.setblocking(False)
@@ -227,7 +239,7 @@ def API_reload(host, port):
   except TimeoutError:
     return 1
   s.close()
-  if not re.compile(b'^HTTP/1\.1 200 OK\r\nServer: NTRIP Millipede Server .*\r\nDate: .*\r\nNtrip-Version: Ntrip/2\.0\r\nContent-Length: \d+\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"result": 0}').match(d):
+  if not re.compile(b'^HTTP/1\\.1 200 OK\r\nServer: NTRIP Millipede Server .*\r\nDate: .*\r\nNtrip-Version: Ntrip/2\\.0\r\nContent-Length: \\d+\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"result": 0}').match(d):
     return 1
   return 0
 
