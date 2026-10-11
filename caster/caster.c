@@ -169,14 +169,16 @@ static void
 dynconfig_free_syncers(struct caster_dynconfig *dyn) {
 	if (dyn->syncers == NULL)
 		return;
-	for (int i = 0; i < dyn->syncers_count; i++) {
+	/* Stop anyone else looking before the entries go away, not after. */
+	int n = dyn->syncers_count;
+	dyn->syncers_count = 0;
+	for (int i = 0; i < n; i++) {
 		if (dyn->syncers[i] != NULL) {
-			syncer_free(dyn->syncers[i]);
+			syncer_decref(dyn->syncers[i]);
 			dyn->syncers[i] = NULL;
 		}
 	}
 	free(dyn->syncers);
-	dyn->syncers_count = 0;
 	dyn->syncers = NULL;
 }
 
@@ -372,16 +374,20 @@ static int caster_reload_syncers(struct caster_state *this, struct config *confi
 
 	if (olddyn != NULL && olddyn->syncers != NULL && olddyn->syncers_count == newdyn->syncers_count) {
 		newdyn->syncers_count = olddyn->syncers_count;
+		/*
+		 * Share the syncer rather than take it out of the old configuration: worker threads
+		 * may still read olddyn->syncers[] until their reference to it is dropped.
+		 */
 		for (int i = 0; i < newdyn->syncers_count; i++) {
 			newdyn->syncers[i] = olddyn->syncers[i];
-			olddyn->syncers[i] = NULL;
+			syncer_incref(newdyn->syncers[i]);
 		}
 	} else {
 		for (int i = 0; i < newdyn->syncers_count; i++) {
 			newdyn->syncers[i] = syncer_new(this, config->node, config->node_count, "/adm/api/v1/sync", 0);
 			if (newdyn->syncers[i] == NULL) {
 				for (int j = 0; j < i; j++)
-					syncer_free(newdyn->syncers[j]);
+					syncer_decref(newdyn->syncers[j]);
 				free(newdyn->syncers);
 				return -1;
 			}
@@ -862,7 +868,11 @@ static int caster_load(struct caster_state *this, int restart) {
 	}
 	new_config->dyn = newdyn;
 	new_config->free_callback = dynconfig_free_callback;
+
 	old_config = atomic_load(&this->config);
+	if (old_config)
+		config_incref(old_config);
+
 	olddyn = old_config?old_config->dyn:NULL;
 
 	if (caster_reopen_logs(this, new_config) < 0)
@@ -890,8 +900,10 @@ static int caster_load(struct caster_state *this, int restart) {
 	if (caster_reload_listeners(this, new_config, olddyn, newdyn) < 0)
 		r = -1;
 
-	if (old_config)
-		config_decref(old_config);
+	if (old_config) {
+		config_decref(old_config);	// our temporary reference
+		config_decref(old_config);	// caster's reference
+	}
 
 	if (restart && caster_start(this, new_config, 0) < 0)
 		r = -1;

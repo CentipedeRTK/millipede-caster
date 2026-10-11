@@ -202,6 +202,13 @@ for caster_args in "${CASTER_ARGS1}" "${CASTER_ARGS2}"; do
 	start ${type} ${caster_args} -c testconfig/caster7.yaml
 	run ${type} ${PID} test-sync-badtable.py test-sync-state-type.py ./test-sync-baddiff.py
 
+	start ${type} ${caster_args} -c testconfig/caster8.yaml
+	run ${type} ${PID} test-syncer-reload-race.py
+
+	cp -pf testconfig/caster9a.yaml testconfig/caster9.yaml
+	start ${type} ${caster_args} -c testconfig/caster9.yaml
+	run ${type} ${PID} test-syncer-node-reload.py
+
     done
     echo FAILS $nfail
     totalfail=`expr $totalfail + $nfail`
