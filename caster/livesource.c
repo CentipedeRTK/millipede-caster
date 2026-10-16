@@ -186,9 +186,14 @@ static int livesource_kill_subscribers_unlocked(struct livesource *this, int kil
 		}
 
 		if (kill_backlogged == 0 || backlogged) {
+			/*
+			 * Here a subscriber is either backlogged, or a direct one of a closed source
+			 * (virtual ones were moved to another source above): close it in both cases,
+			 * so that a client too slow to follow reconnects rather than waits for data
+			 * that will not come.
+			 */
 			_livesource_del_subscriber_unlocked(st);
-			if (!backlogged && !virtual)
-				ntrip_decref_end(st, "livesource_kill_subscribers_unlocked");
+			ntrip_decref_end(st, "livesource_kill_subscribers_unlocked");
 		}
 		bufferevent_unlock(bev);
 	}
@@ -274,21 +279,32 @@ static void _livesource_del_subscriber_unlocked(struct ntrip_state *st) {
 
 void livesource_del_subscriber(struct ntrip_state *st) {
 	/*
+	 * Read the subscription under the ntrip_state lock: the livesource can drop it
+	 * (livesource_kill_subscribers_unlocked(), with both locks held) and free it
+	 * at any time otherwise.
+	 */
+	bufferevent_lock(st->bev);
+	struct subscriber *sub = st->subscription;
+	struct livesource *livesource = sub ? sub->livesource : NULL;
+	if (livesource)
+		livesource_incref(livesource);
+	bufferevent_unlock(st->bev);
+	if (livesource == NULL)
+		return;
+
+	/*
 	 * Lock order is mandatory to avoid deadlocks with livesource_send_subscribers
 	 */
-	struct subscriber *sub = st->subscription;
-	if (sub) {
-		struct livesource *livesource = sub->livesource;
-		livesource_incref(livesource);
-		P_RWLOCK_WRLOCK(&livesource->lock);
-		bufferevent_lock(st->bev);
+	P_RWLOCK_WRLOCK(&livesource->lock);
+	bufferevent_lock(st->bev);
 
+	/* The subscription may have been dropped while no lock was held */
+	if (st->subscription && st->subscription->livesource == livesource)
 		_livesource_del_subscriber_unlocked(st);
 
-		bufferevent_unlock(st->bev);
-		P_RWLOCK_UNLOCK(&livesource->lock);
-		livesource_decref(livesource);
-	}
+	bufferevent_unlock(st->bev);
+	P_RWLOCK_UNLOCK(&livesource->lock);
+	livesource_decref(livesource);
 }
 
 /*
